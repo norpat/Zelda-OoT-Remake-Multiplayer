@@ -46,7 +46,22 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.247"
+VERSION = "0.94.280"
+
+
+def puppet_low_hp_pulse(now):
+    """Rolig, treg puls helt av/på (~5,7 s periode) for tydelig og behagelig lav-HP-varsel."""
+    return 0.5 + 0.5 * math.sin(now * 1.1)
+
+
+def follow_locked_by_peer(friend, roster, own_name):
+    """FOLLOW er eksklusiv: en annen spillers aktive valg låser lokal boks."""
+    if isinstance(friend, dict) and friend.get('follow') is True:
+        return True
+    return any(isinstance(row, dict) and row.get('name') != own_name and row.get('follow') is True
+               for row in (roster or []))
+
+
 CALL_TELEPORT_COOLDOWN = 6.0
 SERVER_URL = os.getenv("OOT_SERVER_URL", "https://oot.premiumaroma.no").strip()
 SERVER_ADDR = ("oot.premiumaroma.no", 443)   # Cloudflare tunnel
@@ -626,6 +641,10 @@ class CounterSync:
         self.p, self.off, self.max, self.name, self.cap_off = p, off, maxv, name, cap_off
         self.expected = p.u32(off); self.my_cum = 0; self.seen = None
         self.behind_since = None   # når vennen fikk et høyere tall enn oss (for utjevning)
+        self.mute_until = 0.0      # v0.94.268: modden skriver selv (PvP-gjenoppretting o.l.) – ikke tell som funn/forbruk
+
+    def mute(self, secs=2.0):
+        self.mute_until = time.time() + secs
 
     def cap(self):
         if self.cap_off is not None:
@@ -640,13 +659,16 @@ class CounterSync:
     def tick(self):
         cur = self.p.u32(self.off)
         if cur != self.expected:
-            self.my_cum += cur - self.expected; self.expected = cur
+            if time.time() >= self.mute_until:
+                self.my_cum += cur - self.expected
+            self.expected = cur
         return cur
 
     def _set(self, new):
         for o in (self.off, self.off + 4):
             self.p.write(self.p.base + o, struct.pack("<I", new))
         self.expected = new          # ikke en egen endring -> påvirker ikke my_cum
+        self.set_t = time.time()
 
     def equalize(self, remote_val, now, force=False):
         """Delt bag: høyeste tall vinner. Ved tilkobling med en gang, ellers når vennen har
@@ -980,8 +1002,8 @@ def perf_report():
 
 MODES = ['Story', 'PvP']   # v0.73
 GAME_MODES = ('Capture the Flame', 'Deathmatch')   # velges i PvP-lobbyen
-LOOKS = ['Green', 'Blue', 'Red', 'Pink']   # v0.67: tunikafarge (romfs-mod OoT_MP_Tunic)
-TUNIC_LETTER = {'Green': 'G', 'Blue': 'B', 'Red': 'R', 'Pink': 'M'}
+LOOKS = ['Green', 'Blue', 'Red', 'Pink', 'Orange', 'Yellow', 'Cyan', 'Purple', 'White', 'Black']   # v0.67: tunikafarge (romfs-mod OoT_MP_Tunic)
+TUNIC_LETTER = {'Green': 'G', 'Blue': 'B', 'Red': 'R', 'Pink': 'M', 'Orange': 'O', 'Yellow': 'Y', 'Cyan': 'C', 'Purple': 'P', 'White': 'W', 'Black': 'K'}
 TUNIC_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__))),
                          'user', 'load', '0400486024DEC000', 'OoT_MP_Tunic')
 COLOR_EN = {'Grønn': 'Green', 'Rød': 'Red', 'Blå': 'Blue', 'Hvit': 'White', 'Gul': 'Yellow', 'Lilla': 'Purple', 'Rosa': 'Pink', 'Oransje': 'Orange', 'Svart': 'Black'}   # hvordan din Link vises hos vennen (Mt_Cloth = trøye + hoveddel av lua)
@@ -1011,7 +1033,7 @@ ZONE_LABELS = {
     "KokiriForest_Child": "Kokiri",
     "HyruleField_Child": "Hyrule Field",
 }
-ROSTER_MODELS = ("Green", "Blue", "Red", "Pink", "No tunic")
+ROSTER_MODELS = tuple(LOOKS) + ("No tunic",)
 
 
 def zone_label(banc):
@@ -2343,8 +2365,121 @@ class PadLink:
         (18, 0x118), (19, 0x118), (20, 0x118), (21, 0x120), (22, 0x130), (23, 0x118),
     )
 
+    F_COPY8 = 0x3C46F80   # copy_v1.pchtxt: copy8(x0=dst, x1=src, x2=len) – kopierer via spillets CPU (Lichii ser skrivingen)
+
+    def guest_va_of(self, p, host_off):
+        """v0.94.261: gjestens VA for en vert-offset. Forskyvningen er ikke lik overalt (heap vs. andre områder
+        er forskjøvet med n*0x80000000) – prøv kandidater og la spillet lese tilbake med F_LD8."""
+        try:
+            want = struct.unpack('<Q', p.read(p.base + host_off, 8))[0]
+        except OSError:
+            return None
+        for k in (0, -1, 1, -2, 2, -3, 3, -4, 4):
+            va = host_off + self.delta + k * 0x80000000
+            got = self.game_call(p, self.F_LD8, (va - 8,), timeout=1.0)
+            if got is not None and (got & 0xFFFFFFFFFFFFFFFF) == want:
+                return va
+        return None
+
+    def host_of_va(self, p, va):
+        """Motsatt: vert-offset for en gjeste-VA (spillet skriver et merke, vi leter blant kandidatene)."""
+        mark = 0x5A5A0000 | (int(time.time()) & 0xFFFF)
+        if self.game_call(p, self.F_ST32, (va, mark)) is None:
+            return None
+        for k in (0, -1, 1, -2, 2, -3, 3, -4, 4):
+            h = va - self.delta - k * 0x80000000
+            try:
+                if 0 <= h < p.size and struct.unpack('<I', p.read(p.base + h, 4))[0] == mark:
+                    return h
+            except OSError:
+                pass
+        return None
+
+    def paint_own_tunic(self, p, color):
+        """v0.94.261: egen Link bytter farge med en gang: nye texler kopieres av spillet (copy8, copy_v1.pchtxt)
+        inn i teksturen egen Link tegnes med, så emulatoren laster den på nytt. Dukkenes kopier røres ikke."""
+        try:
+            col = color.lower()
+            tex = open(os.path.join(TUNIC_DIR, 'self', col, 'tile.texels'), 'rb').read()
+            if self.hR is None or self.delta is None:
+                return 'spillet ikke klart'
+            dst = getattr(self, '_own_tex_va', None)
+            if dst is None:
+                sigs = {}
+                for c in (look.lower() for look in LOOKS):
+                    try:
+                        sigs[c] = open(os.path.join(TUNIC_DIR, 'self', c, 'tile.texels'), 'rb').read()[4096:4096 + 64]
+                    except OSError:
+                        pass
+                hits = []   # (vert-offset, har BNTX-hode)
+                CH = 32 << 20
+                for i0 in range(0, p.size, CH):
+                    try:
+                        blk = p.read(p.base + i0, CH)
+                    except OSError:
+                        continue
+                    for sg in sigs.values():
+                        j0 = blk.find(sg)
+                        while j0 >= 0:
+                            a = i0 + j0 - 4096
+                            try:
+                                hdr = p.read(p.base + a - 0x1000, 4) == b'BNTX'
+                            except OSError:
+                                hdr = False
+                            hits.append((a, hdr)); j0 = blk.find(sg, j0 + 1)
+                bare = [a for a, h in hits if not h]
+                alone = [a for a in bare if all(abs(a - b) > 0x1000000 for b in bare if b != a)]   # dukkenes kopier ligger samlet
+                if len(alone) != 1:
+                    log(f'tunika: maling – uklart hvilken tekstur er egen ({[hex(a) for a in bare]})')
+                    return 'fant ikke egen tunika-tekstur entydig'
+                dst = self.guest_va_of(p, alone[0])
+                if dst is None:
+                    return 'fant ikke gjeste-adressen'
+                self._own_tex_va = dst
+            buf = getattr(self, '_paint_buf', None)
+            if buf is None:
+                va = self.game_call(p, self.F_ALLOC, (0x10, len(tex) + 0x100), timeout=3.0)
+                hb = self.host_of_va(p, va) if va else None
+                if hb is None:
+                    return 'fant ikke minnebufferen'
+                buf = self._paint_buf = (va, hb)
+            p.write(p.base + buf[1], tex)
+            r = self.game_call(p, self.F_COPY8, (dst, buf[0], len(tex)), timeout=5.0)
+            log(f'tunika: malte egen Link {color} ({len(tex)} byte -> 0x{dst:X}) -> {r}')
+            return f'malt {color} -> {r}'
+        except Exception as e:  # noqa: BLE001
+            return f'feil {e!r}'
+
+    def blink_set_target(self, p, act, low):
+        """v0.94.259: registrer dukke for lav-HP-puls; en bakgrunnstråd skriver verdien ~120 ganger i sekundet."""
+        tg = self.__dict__.setdefault('_blink_targets', {})
+        if low:
+            tg[act] = True
+        elif tg.pop(act, None) is not None:
+            self.set_puppet_low_hp_blink(p, act, 0.0)
+        self._blink_p = p
+        if tg and not getattr(self, '_blink_thr', None):
+            def _loop():
+                while True:
+                    tgs = dict(self.__dict__.get('_blink_targets', {}))
+                    if not tgs:
+                        time.sleep(0.2); continue
+                    v = puppet_low_hp_pulse(time.time())
+                    for a_ in tgs:
+                        try:
+                            if not self.set_puppet_low_hp_blink(self._blink_p, a_, v):
+                                self._blink_targets.pop(a_, None)
+                        except Exception:  # noqa: BLE001
+                            self._blink_targets.pop(a_, None)
+                    time.sleep(1 / 120)
+            self._blink_thr = threading.Thread(target=_loop, daemon=True); self._blink_thr.start()
+
     def set_puppet_low_hp_blink(self, p, act, val):
-        """v0.94.243: Skriv 3D rød lav-HP-blink (0.0..0.74) til alle 24 MaterialObj-bufferne på CoopPuppet + sett dirty-flagg 0x0101 (0 game_call)."""
+        """Gjengi native lav-HP-effekt i samtlige parameterbuffere (0 game_call).
+
+        Dirty-bit 0 settes bare hvis det mangler. Å slå det av og på igjen hvert
+        bilde flimrer i 60 Hz uansett hvor rolig sinuskurven er.
+        """
         if p is None or self.delta is None or self.main is None or act is None:
             return False
         act_vt = (self.main + self.ACT_VT) & 0xFFFFFFFFFFFFFFFF
@@ -2353,8 +2488,8 @@ class PadLink:
             if len(hdr) != 0x30 or struct.unpack_from("<Q", hdr, 0)[0] != act_vt or struct.unpack_from("<I", hdr, 0x2C)[0] != 4:
                 return False
             cache = self.__dict__.setdefault("_pup_blink_addrs", {})
-            addrs = cache.get(act)
-            if addrs is None:
+            groups = cache.get(act)
+            if groups is None:
                 d = self.delta
                 u64 = lambda h: struct.unpack("<Q", p.read(p.base + h, 8))[0]
                 ct = u64(act + 0x270)
@@ -2372,21 +2507,44 @@ class PadLink:
                 m_arr = u64(mh - d + 0x150)
                 if not (d < m_arr < d + p.size - 24 * 0x80):
                     return False
-                addrs = []
+                groups = []
                 for mat_idx, u_off in self.PUPPET_BLINK_SLOTS:
                     mat_base = (m_arr - d) + mat_idx * 0x80
-                    sp = u64(mat_base + 0x40)
-                    if d < sp < d + p.size - (u_off + 8):
-                        addrs.append(((sp - d) + u_off, mat_base + 0x2C))
-                cache[act] = tuple(addrs)
-            if not addrs:
+                    ptrs = {f: u64(mat_base + f) for f in (0x40, 0x48, 0x50, 0x58, 0x70)}
+                    if not all(d < ptr < d + p.size - 0x140 for ptr in ptrs.values()):
+                        continue
+                    # Read-only sampling av native Player_Child viste at samme puls
+                    # speiles til disse feltene. Bare +0x40 ga ingen synlig dukkeeffekt.
+                    addrs = [ptrs[0x40] - d + u_off,
+                             ptrs[0x48] - d + 0x28,
+                             ptrs[0x58] - d + u_off - 0x30,
+                             ptrs[0x70] - d + 0x68]
+                    # Kun materialene med denne ekstra parameterblokken har +0x50
+                    # nøyaktig 0x20 bytes før hovedbufferen. Ikke gjet på de øvrige.
+                    if ptrs[0x50] == ptrs[0x40] - 0x20:
+                        addrs.append(ptrs[0x50] - d + u_off + 0x20)
+                    groups.append((tuple(addrs), mat_base + 0x2C))
+                cache[act] = tuple(groups)
+            if not groups:
                 return False
             b4 = struct.pack("<f", float(val))
-            for val_addr, flag_addr in addrs:
-                p.write(p.base + val_addr, b4)
+            _lt = self.__dict__.setdefault('_blink_log_t', {})
+            if time.time() - _lt.get(act, 0) > 2.0:   # v0.94.263: diagnostikk (blink bare på blå dukke)
+                _lt[act] = time.time()
+                try:
+                    _nv = struct.unpack('<Q', p.read(p.base + act + 0x260, 8))[0]
+                    _nm = p.read(p.base + _nv - self.delta, 40).split(bytes(1), 1)[0].decode('ascii', 'replace')
+                except Exception:  # noqa: BLE001
+                    _nm = '?'
+                log(f'blink: {_nm} @0x{act:X} grupper={len(groups)} verdi={float(val):.2f} mål={len(self.__dict__.get("_blink_targets", {}))}')
+            _only40 = getattr(self, 'blink_mode', 'all') == '40'   # v0.94.264: test – bare hovedbufferen (+0x40) som spillet selv
+            for addrs, flag_addr in groups:
+                for val_addr in (addrs[:1] if _only40 else addrs):
+                    p.write(p.base + val_addr, b4)
                 cur_f = struct.unpack("<I", p.read(p.base + flag_addr, 4))[0]
-                if (cur_f & 0x0101) != 0x0101:
-                    p.write(p.base + flag_addr, struct.pack("<I", cur_f | 0x0101))
+                want_f = cur_f | 0x0101
+                if want_f != cur_f:
+                    p.write(p.base + flag_addr, struct.pack("<I", want_f))
             return True
         except (OSError, struct.error):
             return False
@@ -2802,6 +2960,12 @@ class PadLink:
         except OSError:
             return False
 
+    # v0.94.268: tilfeldige drops (navn fra daurosk docs/objects.md «Drops»). Spores som borte-hos-én = borte-hos-begge,
+    # og slettes når de dukker opp der vår kopi ble drept fordi vennen drepte fienden (ellers dobbel loot).
+    DROP_NAMES = frozenset(('Obj_Rupee_Green', 'Obj_Rupee_Blue', 'Obj_Rupee_Red', 'Obj_Rupee_Purple', 'Obj_Rupee_Silver',
+                            'Obj_Rupee_Gold', 'Obj_Heart', 'Obj_MagicJar_Small', 'Obj_MagicJar_Large', 'Obj_ArrowBundle_Small',
+                            'Obj_ArrowBundle_Medium', 'Obj_ArrowBundle_Large', 'Obj_Bomb', 'Obj_Bombchu', 'Obj_DekuNut',
+                            'Obj_DekuSeed', 'Obj_Arrow_Fire', 'Obj_Fairy'))
     SYNC_PREFIX = ('Enemy_', 'Obj_Pot', 'Obj_Rock', 'Obj_Stone', 'Obj_Boulder', 'Obj_Bush', 'Obj_Grass', 'Obj_Kusa', 'Obj_Barrel', 'Obj_Crate', 'Obj_WoodBox', 'Obj_Deku_MoveFloor', 'Obj_MoveFloor', 'Obj_Lift', 'Obj_MovableBox', 'Obj_PushBlock', 'Obj_SpiderWeb', 'Obj_Deku_SpiderWeb', 'Obj_Web', 'Obj_Cobweb', 'Obj_Kumo', 'Obj_Deku_Web', 'Obj_InsideTheDekuTree_SpiderWeb', 'Obj_InsideTheDekuTree_InteractiveSpiderWeb', 'Obj_InsideTheDekuTree_FallingLadder', 'Obj_InsideTheDekuTree_FallingFloor', 'Obj_InsideTheDekuTree_Stopper', 'Obj_InsideTheDekuTree_WaterGate')
 
     ACT_MGR_PTR = 0x4E91888        # daurosk/oot-remake-multiplayer (GPLv3, docs/objects.md): [[main+0x4E91888]+0x118]+0x670 = aktørliste
@@ -2935,7 +3099,7 @@ class PadLink:
                                 self.__dict__.setdefault('_navis', {})[a] = now
                             if nm.startswith(('Weapon_', 'Obj_DekuStick', 'Item_')):
                                 self.__dict__.setdefault('_weapons', {})[a] = (nm, now)
-                            if nm.startswith(prefix or self.SYNC_PREFIX) and 'Boss' not in nm:
+                            if (nm.startswith(prefix) if prefix else (nm.startswith(self.SYNC_PREFIX) or nm in self.DROP_NAMES)) and 'Boss' not in nm:
                                 pos = p.f32(a + 0x31C, 3)
                                 if all(math.isfinite(v) for v in pos) and abs(pos[0]) + abs(pos[1]) + abs(pos[2]) > 1.0:
                                     found[a] = (nm, tuple(pos))
@@ -2991,7 +3155,7 @@ class PadLink:
                     if nm.startswith(('Weapon_', 'Obj_DekuStick', 'Item_')):
                         self.__dict__.setdefault('_weapons', {})[a] = (nm, now)
                         pg = a & ~0xFFFFF; pages.update((pg - 0x100000, pg, pg + 0x100000))
-                    if not nm.startswith(self.SYNC_PREFIX) or 'Boss' in nm:
+                    if not (nm.startswith(self.SYNC_PREFIX) or nm in self.DROP_NAMES) or 'Boss' in nm:
                         if full and diag is not None:   # v0.89: egen liste per kall (delt _diag_all ble nullstilt av andre tråder)
                             diag[a] = nm
                         elif full and getattr(self, '_diag_all', None) is not None:
@@ -3309,6 +3473,22 @@ class PadLink:
                 self._diag_all = None
                 loaded.add(load_key)
                 return   # neste forsøk (om 5 s) tar den på
+            # v0.94.280: har Link allerede på seg dette plagget (f.eks. etter omstart av modden i samme spill)?
+            # Å ta på samme stykke igjen frøs spilltråden (23:29:55, Armor_Child_Tunic_C). Sjekk aktørene ved Link først.
+            try:
+                lp_ = p.f32(c_act + 0x31C, 3)
+                dgw = {}; self._scan_full_t = 0; self._scan_actors_raw(p, dgw); self._diag_all = None
+                worn = any(nm == name and math.dist(p.f32(ha + 0x31C, 3), lp_) < 0.3 for ha, nm in dgw.items())
+                other = any(nm.startswith('Armor_Child_Tunic_') and nm != name and math.dist(p.f32(ha + 0x31C, 3), lp_) < 0.3 for ha, nm in dgw.items())
+                # v0.94.279/280: oppstartsfargen ligger i romfs – uten annet mod-plagg på er Link allerede riktig farge
+                if who == 'me' and look == getattr(self, 'romfs_look', None) and not other:
+                    worn = True
+            except OSError:
+                worn = False
+            if worn:
+                self.__dict__[{'l2': '_tun_done', 'me': '_tun_done_me'}.get(who, '_tun_done_bot')] = (copy, look)
+                log(f"tunika: {'Link 2' if who == 'l2' else 'min Link'} har allerede {name} på – tar ikke på igjen")
+                return
             r = self.game_call(p, self.F_EQUIP, (eu, 8, self.R + 0x7F8, 2, 0xFFFFFFFFFFFFFFFF, 1, 0), timeout=3.0)
             who_label = 'Link 2' if who == 'l2' else 'min Link'
             log(f'tunika: {who_label} tar på {name} -> {r}')
@@ -4379,7 +4559,8 @@ class PadLink:
                                 self.__dict__.get('_tun_worn', {}).pop(who_, None)
                                 for m in self.TUNIC_SHOW + ('Mt_Cloth_Pants',):
                                     self.set_material_visible(p, act_, m, True)
-                                self.__dict__.pop('_tun_done' if who_ == 'l2' else '_tun_done_me', None)
+                                if who_ == 'l2':   # v0.94.265: egen Link tas IKKE på igjen automatisk (samme stykke to ganger -> frys)
+                                    self.__dict__.pop('_tun_done', None)
                                 self.__dict__.pop('_tun_fail' if who_ == 'l2' else '_tun_fail_me', None)
                                 log(f'tunika: delen falt av {"Link 2" if who_ == "l2" else "min Link"} ({off:.1f} m) – viser vanlig tunika og tar på igjen')
                     except Exception as e:  # noqa: BLE001
@@ -4387,14 +4568,18 @@ class PadLink:
                     finally:
                         self._tun_watch_busy = False
                 threading.Thread(target=_watch, daemon=True).start()
-        # v0.94.222: F_EQUIP (0x2DF7B20) i _wear_tunic frøs klienten i Story-modus; bare nødvendig ved PvP-lagbytte (Story bruker romfs-tunika).
+        # v0.94.222: F_EQUIP (0x2DF7B20) i _wear_tunic frøs GAMER2 i Story-modus; bare nødvendig ved PvP-lagbytte (Story bruker romfs-tunika).
         ml = getattr(self, 'my_look', None)
-        if (False and ml in TUNIC_LETTER and self.player is not None and self.p_act is not None
+        # v0.94.265: egen farge live igjen – men equip KUN ved fargebytte, aldri samme farge to ganger på samme Link
+        # (frysen i v0.94.222 kom trolig av at vakta tok på samme stykke igjen; daurosk: equip bare når navnet avviker).
+        _tried = self.__dict__.setdefault('_own_tun_tried', {})   # (spiller, farge) -> antall forsøk (1 = last pakken, 2 = ta på)
+        if (ml in TUNIC_LETTER and self.player is not None and self.p_act is not None
+                and _tried.get((self.player, ml), 0) < 2
                 and getattr(self, '_tun_done_me', None) != (self.player, ml) and getattr(self, '_tun_fail_me', None) != (self.player, ml)
                 and now - getattr(self, '_tun_try', 0) > 5.0
                 and not getattr(self, '_tun_busy', False) and not getattr(self, '_spawning', False)
                 and now - getattr(self, '_tp_t', 0) > 8.0 and self._zone_ready(p, now)):
-            self._tun_try = now; self._tun_busy = True
+            self._tun_try = now; self._tun_busy = True; _tried[(self.player, ml)] = _tried.get((self.player, ml), 0) + 1
             threading.Thread(target=self._wear_tunic, args=(p, self.player, self.p_act, ml, 'me'), daemon=True).start()
         if alive and self._zone_ready(p, now):
             threading.Thread(target=self._cleanup_orphans, args=(p, now), daemon=True).start() if now - getattr(self, "_orph_t", 0) >= 5.0 else None
@@ -4884,7 +5069,7 @@ def asset_fingerprint(load_root=None):
 class PuppetFollower:
     """v0.94.160: port av oppstrøms `CoopFollow::Follower`.
 
-    Kilde: `<mod_dir>\\ext\\daurosk\\lichii\\hook\\coop_follow.h` (GPL-3.0-or-later).
+    Kilde: `D:\\Switch2\\ext\\daurosk\\lichii\\hook\\coop_follow.h` (GPL-3.0-or-later).
 
     Modellen: dukken skal ikke teletransporteres til målet hvert bilde. En
     *jeger* per dukke bæres fram av en utglattet fart, lukker resten av gapet
@@ -5110,6 +5295,13 @@ class App:
         self.look = self.cfg.get("look") if self.cfg.get("look") in LOOKS else 'Red'
         self.look_var = tk.StringVar(value=self.look)
         self.pad.my_look = self.look
+        try:   # v0.94.279: fargen auto_restart la i romfs ved spillstart
+            _md = os.path.dirname(sys.executable if getattr(sys, 'frozen', False) else os.path.abspath(__file__))
+            _rl = os.path.join(os.path.dirname(_md), 'user', 'load', '0400486024DEC000', 'OoT_MP_Tunic', 'romfs_look.txt')
+            self.pad.romfs_look = open(_rl, encoding='utf-8').read().strip() if os.path.isfile(_rl) else self.look
+        except OSError:
+            self.pad.romfs_look = self.look
+        log(f'tunika: oppstartsfarge i romfs = {self.pad.romfs_look}')
         self.pad.link2_actor = self.cfg.get('link2_actor') or 'Player_Child'
         cb_look = ttk.Combobox(top_in, textvariable=self.look_var, values=LOOKS, width=11, state="readonly")
         cb_look.pack(side="left", padx=(6, 0))
@@ -5194,6 +5386,30 @@ class App:
         self.conn_window = None
         self.conn_popup_list = None
         self.ip_var = tk.StringVar(value=self.cfg.get("last_ip", ""))
+
+        # --- Story-kanaler: Public er standard; private lobbyer isolerer dukker og chat. ---
+        self.story_lobby_outer, slc = card(root, "Story lobby")
+        if self.mode != 'Story':
+            self.story_lobby_outer.pack_forget()
+        self.story_lobby_info = tk.Label(slc, text="Public · everyone", bg=PANEL, fg=GOLD,
+                                         font=("Segoe UI", 10, "bold"), justify="center")
+        self.story_lobby_info.pack(fill="x", padx=10, pady=(4, 3))
+        self.story_lobby_list = tk.Listbox(slc, height=4, bg=FIELD, fg=FG, selectbackground=SEL,
+                                           highlightthickness=1, highlightbackground=BORDER,
+                                           borderwidth=0, font=("Segoe UI", 9))
+        self.story_lobby_list.pack(fill="x", padx=10, pady=3)
+        self.story_lobby_list.bind('<ButtonRelease-1>', lambda _e: self._story_lobby_join())
+        slcreate = tk.Frame(slc, bg=PANEL); slcreate.pack(fill="x", padx=10, pady=(2, 2))
+        self.story_lobby_name = tk.StringVar()
+        self.story_lobby_entry = ttk.Entry(slcreate, textvariable=self.story_lobby_name, width=18)
+        self.story_lobby_entry.pack(side="left", fill="x", expand=True)
+        self.story_lobby_entry.bind('<Return>', lambda _e: self._story_lobby_create())
+        ttk.Button(slcreate, text="Create", command=self._story_lobby_create).pack(side="right", padx=(4, 0))
+        slpass = tk.Frame(slc, bg=PANEL); slpass.pack(fill="x", padx=10, pady=(0, 8))
+        tk.Label(slpass, text="Password (optional)", bg=PANEL, fg=MUTED, font=("Segoe UI", 8)).pack(side="left")
+        self.story_lobby_password = tk.StringVar()
+        self.story_lobby_password_entry = ttk.Entry(slpass, textvariable=self.story_lobby_password, show='•', width=14)
+        self.story_lobby_password_entry.pack(side="right", fill="x", expand=True, padx=(6, 0))
 
         # --- Story-modus Boss-HP-boks (dukker automatisk opp kun under bosskamp, skjules ellers) ---
         self.boss_outer, bc = card(root, "Boss")
@@ -5483,10 +5699,12 @@ class App:
                 self._pvp_in_arena = False; self._pvp_social_lobby = False
                 self._ctf_actors = {}; self._ctf_lit = {}; self._ctf_friend_lit = {}; self._ctf_point_sent = {}
                 self.boss_outer.pack_forget(); self._boss_card_shown = False
+                self.story_lobby_outer.pack_forget()
                 self.lobby_outer.pack(fill='x', padx=14, pady=4, before=self._status_row)
             else:
                 self.follow_cb.pack(side="right")
                 self.lobby_outer.pack_forget()
+                self.story_lobby_outer.pack(fill='x', padx=14, pady=4, before=self._status_row)
                 self._pvp_in_arena = False; self._pvp_social_lobby = False
                 self._ctf_actors = {}; self._ctf_lit = {}; self._ctf_friend_lit = {}; self._ctf_point_sent = {}
                 self._reload_due = 0   # Ingen samtidig banc-reload i modusovergangen.
@@ -5522,6 +5740,49 @@ class App:
         except Exception as e:  # noqa: BLE001
             log(f'modus: spillovergang feilet {e!r}')
 
+    @staticmethod
+    def _tunic_mod_dir():
+        return os.path.join(os.path.dirname(APP_DIR), "user", "load", "0400486024DEC000", "OoT_MP_Tunic")
+
+    @classmethod
+    def _detect_boot_look(cls):
+        """v0.94.254: Finn hvilken tunikafarge romfs/Tex/Angin_Tile_A_Alb.bntx.zs hadde da spillet startet."""
+        try:
+            mod = cls._tunic_mod_dir()
+            cur = os.path.join(mod, "romfs", "Tex", "Angin_Tile_A_Alb.bntx.zs")
+            if not os.path.isfile(cur):
+                return "Green"
+            cur_b = open(cur, "rb").read()
+            for lk in LOOKS:
+                ref = os.path.join(mod, "self", lk.lower(), "Tex", "Angin_Tile_A_Alb.bntx.zs")
+                if os.path.isfile(ref) and open(ref, "rb").read() == cur_b:
+                    return lk
+        except OSError:
+            pass
+        return "Green"
+
+    @classmethod
+    def _sync_own_tunic_romfs(cls, lk):
+        """v0.94.254: Kopier valgt farge inn i romfs/Tex/ med én gang så neste oppstart også har riktig farge."""
+        import shutil
+        col = lk.lower() if lk in LOOKS else None
+        if not col:
+            return False
+        try:
+            mod = cls._tunic_mod_dir()
+            src_dir = os.path.join(mod, "self", col, "Tex")
+            dst_dir = os.path.join(mod, "romfs", "Tex")
+            if not os.path.isdir(src_dir) or not os.path.isdir(dst_dir):
+                return False
+            for fn in ("Angin_Tile_A_Alb.bntx.zs", "Angin_Tile_A_Dark_Alb.bntx.zs"):
+                s = os.path.join(src_dir, fn)
+                if os.path.isfile(s):
+                    shutil.copyfile(s, os.path.join(dst_dir, fn))
+            return True
+        except OSError as e:
+            log(f'tunika: romfs-kopiering feilet ({lk}): {e}')
+            return False
+
     def _save_look(self):
         lk = self.look_var.get()
         if lk in LOOKS:
@@ -5529,7 +5790,69 @@ class App:
             if lk in ('Red', 'Blue'):
                 self._pvp_team = lk
             log(f'utseende valgt: {lk}')
-            self._append_chat_sys(f'👕 {lk} tunic: your friend sees it now – your own Link changes after the game restarts')
+            self._append_chat_sys(f'👕 {lk} lagret. Egen Link beholder oppstartsfargen til spillet startes på nytt.')
+
+    def _self_tunic_tick(self, now):
+        """v0.94.257: overlayen fra v0.94.254 er av.
+
+        Den spawnet CoopPuppet_<farge> og skjulte materialer på dukkene som
+        eksterne spillere allerede bruker. Egen farge kommer fra romfs ved
+        oppstart (auto_restart.apply_tunic). Denne funksjonen gjør én
+        opprydding: vis materialene igjen på egen Link og på dukker i nærheten.
+        Den lager ingen nye aktører.
+        """
+        if getattr(self, '_st_undo_done', False) or getattr(self, '_st_undo_busy', False):
+            return
+        if not self.ready or self.p is None or self.pad.p_act is None:
+            return
+        if not self.pad.cur_banc or not self.pad._zone_ready(self.p, now):
+            return
+        self._st_undo_busy = True
+        p, p_act = self.p, self.pad.p_act
+
+        def _show(act, materials):
+            if not act or not self.pad.actor_alive(p, act):
+                return 0
+            n = 0
+            for m in materials:
+                if self.pad.set_material_visible(p, act, m, True) is not None:
+                    n += 1
+            return n
+
+        def _undo():
+            try:
+                own = _show(p_act, self.pad.TUNIC_SHOW)
+                pos = self.pad.my_apos(p)
+                found = self.pad._list_actors_raw(p, prefix='CoopPuppet_') or {}
+                near = []
+                for act in found:
+                    if act == p_act or not self.pad.actor_alive(p, act):
+                        continue
+                    if pos is None:
+                        near.append(act)
+                        continue
+                    try:
+                        raw = p.read(p.base + act + 0x31C, 12)
+                        q = struct.unpack('<3f', raw) if len(raw) == 12 else None
+                    except (OSError, struct.error):
+                        q = None
+                    # Parkerete dukker ligger på y=-2000. Overlayen kan ha gjemt
+                    # materialene deres, og poolen gjenbruker dem ved neste farge.
+                    if q is not None and (math.dist(pos, q) < 40.0 or q[1] < -100.0):
+                        near.append(act)
+                    if len(near) >= 8:
+                        break
+                show = self.pad.TUNIC_SHOW + self.pad.TUNIC_HIDE
+                restored = sum(_show(act, show) for act in near)
+                log(f'tunika: overlay av. Egen Mt_Cloth satt på {own} materiale(r), '
+                    f'{len(near)} nær-dukke(r) fikk materialene synlige igjen ({restored} kall).')
+            except Exception as e:  # noqa: BLE001
+                log(f'tunika: opprydding feilet {e!r}')
+            finally:
+                self._st_undo_done = True
+                self._st_undo_busy = False
+
+        threading.Thread(target=_undo, daemon=True).start()
 
     def _save_color(self):
         c = self.color_var.get()
@@ -5850,7 +6173,9 @@ class App:
         del self.chat_out[:-8]
         self._append_chat_msg(self.name, item["text"], self.hat_color)
         log(f"chat ut ({self.name}): {item['text']}")
-        if self.peer and hasattr(self, "gs"):
+        if time.time() - getattr(self, '_server_seen', 0) < 5:
+            self._server_cmd('chat', text=item['text'])
+        elif self.peer and hasattr(self, "gs"):
             try:
                 pkt = {"t": "chat", "s": self.session, "chat": list(self.chat_out)}
                 self.gs.sendto(json.dumps(pkt).encode(), self.peer)
@@ -5970,6 +6295,7 @@ class App:
                 f"rupees=guest+0x{rup:X} ({p.u32(rup)}), markør=0x{p.u32(rup + 12):08X}, "
                 f"forskyvning {pos - DEFAULT_POS_OFF:+#x}")
             self.syncs = {}
+            self.cnt_epoch = random.getrandbits(32)   # v0.94.268: nye tellere (my_cum=0) -> vennen må nullstille «seen»
             for name, rel, cap_rel, _label in ITEMS:
                 if valid_counter(p, rup + rel):
                     self.syncs[name] = CounterSync(p, rup + rel, 999, name, rup + cap_rel)
@@ -6371,6 +6697,23 @@ class App:
             log(f"server: {e.get('name')} {e.get('kind')} ({e.get('reason')})")
         self._pres_seq_seen = top
 
+    def _handle_server_chat(self, messages):
+        """Vis hver servermelding én gang; egen melding er allerede vist lokalt."""
+        if not isinstance(messages, list):
+            return
+        seen = self.__dict__.setdefault('_server_chat_seen', set())
+        for item in messages:
+            if not isinstance(item, dict):
+                continue
+            seq, sender, text = item.get('seq'), item.get('name'), item.get('text')
+            if not isinstance(seq, int) or seq in seen or not isinstance(text, str) or not text:
+                continue
+            seen.add(seq)
+            if sender != self.name:
+                self._append_chat_msg(str(sender or '?'), text[:240], item.get('color') or 'Hvit')
+        if len(seen) > 2000:
+            self._server_chat_seen = set(sorted(seen)[-1000:])
+
     def _server_says_friend_present(self, now):
         """PvP: serveren bestemmer om vennen er med. Uten svar fra serveren (offline) faller vi tilbake til direkte trafikk."""
         if getattr(self, 'mode', 'Story') != 'PvP' or now - getattr(self, '_server_seen', 0) > 5:
@@ -6411,7 +6754,22 @@ class App:
         pos = pad.my_apos(p)
         if pos is None:
             return {'banc': banc}
-        pose = {'banc': banc, 'pos': [round(v, 2) for v in pos]}
+        pose = {'banc': banc, 'pos': [round(v, 2) for v in pos],
+                'follow': bool(getattr(self, 'tvang', False))}
+        # Ikke stol på Tk-løkkens cache: les fersk HP direkte i servertråden (0 game_call).
+        hearts = None
+        try:
+            hp_off = self.rupees.off
+            h_cur, h_max = p.u32(hp_off + 0x28), p.u32(hp_off + 0x50)
+            if 0 <= h_cur <= 80 and 4 <= h_max <= 80:
+                hearts = [h_cur, h_max]
+                self._my_hearts_last = hearts
+        except (AttributeError, OSError):
+            hearts = getattr(self, '_my_hearts_last', None)
+        if (isinstance(hearts, (list, tuple)) and len(hearts) == 2
+                and all(isinstance(v, (int, float)) and not isinstance(v, bool) for v in hearts)
+                and 0 <= hearts[0] <= 80 and 4 <= hearts[1] <= 80):
+            pose['hearts'] = [int(hearts[0]), int(hearts[1])]
         rot = pad.my_arot(p)
         if rot is not None:
             # Inverse of the yaw-to-matrix conversion in write_puppet_batch.
@@ -6476,7 +6834,31 @@ class App:
             self._server_score = clean; self._server_round = rnd; self._server_state = m
             self.pvp_peers = m['peers'] if isinstance(m.get('peers'), list) else []
             self._handle_presence(m)
+            self._handle_server_chat(m.get('chat'))
+            si_ = m.get('story_inv')
+            if getattr(self, '_inv_load_pending', 0) and isinstance(si_, dict):
+                self._inv_load_pending = 0; self._sinv_loaded = True
+                if not si_.get('inv'):
+                    self._append_chat_sys(f'💾 No saved Story inventory for {self.name} yet')
+                elif self.p and self.ready and getattr(self, 'rupees', None) and getattr(self, 'mode', 'Story') == 'Story':
+                    try:
+                        done, nb = self._story_inv_apply(si_['inv'])
+                        self._sinv_last = None
+                        self._append_chat_sys(f"💾 Inventory loaded: {', '.join(done)} (+{nb} items)")
+                    except OSError as e:
+                        self._append_chat_sys(f'⚠️ Inventory load failed: {e}')
             if not is_pvp:
+                lobby = m.get('lobby') or {}
+                token = (lobby.get('id'), lobby.get('name'))
+                if token != getattr(self, '_story_lobby_token', None):
+                    if getattr(self, '_story_lobby_token', None) is not None:
+                        self._append_chat_sys(f"🌍 Story channel: {lobby.get('name') or 'Public'}")
+                    self._story_lobby_token = token
+                error = m.get('error')
+                if error and error != getattr(self, '_server_error', None):
+                    self._append_chat_sys(f'⚠️ {error}')
+                self._server_error = error
+                self._draw_story_lobby()
                 continue
             if isinstance(m.get('shop'), dict):
                 self._pvp_shop = m['shop']
@@ -6614,6 +6996,42 @@ class App:
         members = state.get('members', [])
         me = next((p for p in members if p.get('name') == self.name), {})
         self._server_cmd('ready', ready=not bool(me.get('ready')))
+
+    def _story_lobby_create(self):
+        name = " ".join(self.story_lobby_name.get().split())[:24]
+        if not name:
+            self._append_chat_sys('Skriv inn et lobbynavn, f.eks. noobcrew')
+            return
+        password = self.story_lobby_password.get()[:64]
+        self.story_lobby_name.set('')
+        self.story_lobby_password.set('')
+        self._server_cmd('story_create', lobby_name=name, password=password)
+
+    def _story_lobby_join(self):
+        selection = self.story_lobby_list.curselection()
+        ids = getattr(self, '_story_lobby_ids', [])
+        if selection and selection[0] < len(ids):
+            self._server_cmd('story_join', lobby=ids[selection[0]], password=self.story_lobby_password.get()[:64])
+
+    def _draw_story_lobby(self):
+        if not hasattr(self, 'story_lobby_list') or getattr(self, 'mode', 'Story') != 'Story':
+            return
+        state = getattr(self, '_server_state', {})
+        current = state.get('lobby') or {}
+        members = state.get('members') or []
+        self.story_lobby_info.config(text=f"{current.get('name') or 'Public'} · {len(members)} player(s)")
+        games = [g for g in (state.get('lobbies') or []) if g.get('id') == 0 or g.get('game_mode') == 'story']
+        if not any(g.get('id') == 0 for g in games):
+            games.insert(0, {'id': 0, 'name': 'Public', 'players': 0, 'capacity': 50})
+        items = [f"{'●' if g.get('id') == current.get('id') else '○'} {'🔒 ' if g.get('protected') else ''}{g.get('name')}  ({g.get('players', 0)})" for g in games]
+        old_selection = self.story_lobby_list.curselection()
+        if list(self.story_lobby_list.get(0, 'end')) != items:
+            self.story_lobby_list.delete(0, 'end')
+            for item in items:
+                self.story_lobby_list.insert('end', item)
+            if old_selection and old_selection[0] < len(items):
+                self.story_lobby_list.selection_set(old_selection[0])
+        self._story_lobby_ids = [g.get('id') for g in games]
 
     def _draw_lobby(self):
         if not hasattr(self, 'lobby_games') or getattr(self, 'mode', 'Story') != 'PvP':
@@ -7140,16 +7558,25 @@ class App:
                     self._append_chat_sys(f"You both had {f_col} – your colour was switched to {alt} so you differ!")
                 if "chat" in m:
                     self._handle_incoming_chat(m.get("s"), m.get("chat"))
-                if t == "state" and self.ready and getattr(self, 'mode', 'Story') != 'PvP':   # v0.93: eget inventar i PvP
+                # v0.94.277: serveren styrer inventaret (eget per spiller, husket på navn) – ingen P2P-deling av rupees/ammo/bag
+                if t == "state" and self.ready and getattr(self, 'mode', 'Story') != 'PvP' and not self.cfg.get('server_inventory', True):
                     try:
+                        # v0.94.268: «reset» over kan allerede være brukt opp av en «fast»-pakke (sesjonen settes der),
+                        # og spill-omkobling lager nye tellere uten ny sesjon. Da ble vennens kumulative tall regnet som
+                        # funn (+102 rupees). Egen teller-epoke per tellersett, sjekket bare her i state-pakkene.
+                        ce = (m.get("s"), m.get("ce"))
+                        creset = ce != getattr(self, '_friend_ce', None) or getattr(self, '_my_ce_seen', None) != (getattr(self, 'cnt_epoch', 0), id(self.syncs))
+                        self._friend_ce = ce; self._my_ce_seen = (getattr(self, 'cnt_epoch', 0), id(self.syncs))
+                        if creset:
+                            log(f"tellere: ny teller-epoke (venn {ce[1]}) – nullstiller kumulative tall")
                         cums = m.get("cums") or {"rupees": m.get("cum", 0)}
                         vals = m.get("vals") or {"rupees": m.get("rupees")}
                         for n, c in self.syncs.items():
                             if n in cums:
-                                c.apply(cums[n], reset)
-                            c.equalize(vals.get(n), now, force=reset)
+                                c.apply(cums[n], creset)
+                            c.equalize(vals.get(n), now, force=creset)
                         if getattr(self, "bag", None):
-                            self.bag.apply(m, reset, now)
+                            self.bag.apply(m, creset, now)
                     except OSError:
                         pass
             alive = bool(self.friend and now - self.friend_t < 2) and self._server_says_friend_present(now)
@@ -7199,10 +7626,89 @@ class App:
 
     AMMO_REFUND = {0x8E8: 'nøtter', 0x910: 'frø', 0x938: 'pinner'}   # pinner tas ikke med: de brukes også opp når en brennende pinne knekker
 
+    def _story_inv_snapshot(self):
+        """v0.94.268: Story-inventaret per spiller (navn) til serveren: tellere, pinner og hele bag-blokken."""
+        p, rup = self.p, self.rupees.off
+        inv = {n: int(c.expected) for n, c in self.syncs.items()}
+        inv['sticks'] = int(p.u32(rup + 0x938))
+        bag = getattr(self, 'bag', None)
+        if bag:
+            inv['bag'] = {f'{r:x}': int(bag.last.get(r, 0)) for r in bag.rels if r not in bag.ignored and bag.last.get(r)}
+            for r, c in bag.counters.items():
+                if r not in bag.ignored:
+                    inv['bag'][f'{r:x}'] = int(c.expected)
+        return inv
+
+    def _story_inv_tick(self, now):
+        if (getattr(self, 'mode', 'Story') != 'Story' or not (self.p and self.ready and getattr(self, 'rupees', None))
+                or now - getattr(self, '_sinv_t', 0) < 2.0):
+            return
+        self._sinv_t = now
+        if getattr(self, '_sinv_rup', None) != self.rupees.off:     # nytt spill/tilkobling: vent 20 s før første lagring
+            self._sinv_rup = self.rupees.off; self._sinv_ready = now + 20
+            if self.cfg.get('server_inventory', True):   # ny tilkobling: hent eget inventar fra serveren
+                self._sinv_loaded = False; self._inv_load_pending = now; self._server_cmd('inv_get')
+                log(f'inv-db: henter Story-inventar for {self.name} fra serveren (tilkobling)')
+            return
+        if self.cfg.get('server_inventory', True) and not getattr(self, '_sinv_loaded', True):
+            # ikke lagre før serveren har svart (ellers kunne spillets lagringsfil overskrive serverens inventar)
+            if now - (getattr(self, '_inv_load_pending', 0) or 0) > 10:
+                self._inv_load_pending = now; self._server_cmd('inv_get')
+            return
+        if now < getattr(self, '_sinv_ready', 0) or now - (getattr(self, '_inv_load_pending', 0) or 0) < 10:
+            return
+        try:
+            inv = self._story_inv_snapshot()
+        except (OSError, AttributeError):
+            return
+        last_ = getattr(self, '_sinv_last', None)
+        if isinstance(last_, dict) and inv != last_:   # v0.94.278: revisjon – hver endring i loggen (for mye loot synes med en gang)
+            ch = [f'{k} {last_.get(k)}->{v}' for k, v in inv.items() if k != 'bag' and last_.get(k) != v]
+            nb = sum(1 for k, v in (inv.get('bag') or {}).items() if (last_.get('bag') or {}).get(k) != v)
+            if ch or nb:
+                big = any(k == 'rupees' and isinstance(last_.get(k), int) and v - last_[k] > 200 for k, v in inv.items())
+                log(f"inv-db: endring {', '.join(ch)}{f' (+{nb} bag-poster)' if nb else ''}{' – MISTENKELIG STOR ØKNING' if big else ''}")
+        if inv != getattr(self, '_sinv_last', None) and self._server_cmd('inv_save', inv=inv):
+            self._sinv_last = inv
+
+    def _story_inv_apply(self, inv):
+        """Skriv lagret Story-inventar (fra serveren) inn i spillet. Bare på /inv load."""
+        p, rup = self.p, self.rupees.off
+        done = []
+        for n, c in self.syncs.items():
+            v = inv.get(n)
+            if isinstance(v, int) and 0 <= v <= 999:
+                c._set(min(c.cap(), v)); done.append(f'{n}={v}')
+        v = inv.get('sticks')
+        if isinstance(v, int) and 0 <= v <= 99:
+            for o in (0x938, 0x93C):
+                p.write(p.base + rup + o, struct.pack('<I', v))
+            done.append(f'sticks={v}')
+        bag = getattr(self, 'bag', None); nb = 0
+        if bag and isinstance(inv.get('bag'), dict):
+            for k, v in inv['bag'].items():
+                try:
+                    r = int(k, 16)
+                except (TypeError, ValueError):
+                    continue
+                if r not in bag.rels or r in bag.ignored or not isinstance(v, int) or not 0 <= v <= 0xFFFFFFFF:
+                    continue
+                if r in bag.counters:
+                    bag.counters[r]._set(v)
+                else:
+                    bag._write(r, v)
+                nb += 1
+        log(f'inv-db: lastet Story-inventar for {self.name}: {", ".join(done)}, {nb} bag-poster')
+        return done, nb
+
     def _ammo_tick(self, now):
         """Ammo brukt av Link 2 (vennens kast speiles i vårt spill) gis tilbake: faller tallet uten at VI har trykket en
         gjenstandsknapp de siste 1,5 s, var det Link 2."""
         if not (self.p and self.ready and getattr(self, 'rupees', None)) or now - getattr(self, '_am_t', 0) < 0.05:
+            return
+        # v0.94.268: AV med dukker (standard): ingen Link 2-kopi bruker ammo lenger. Refusjonen spiste i stedet vennens
+        # forbruk som kom via den delte telleren og sendte det tilbake som +1 -> uendelig med nøtter/frø.
+        if bool(getattr(self, 'cfg', {}).get('pvp_puppet_pool', True)):
             return
         self._am_t = now
         try:
@@ -7214,6 +7720,9 @@ class App:
             for rel, nm in self.AMMO_REFUND.items():
                 v = self.p.u32(self.rupees.off + rel)
                 old = last.get(rel)
+                sy_ = next((c for c in self.syncs.values() if c.off == self.rupees.off + rel), None)
+                if sy_ is not None and now - getattr(sy_, 'set_t', 0) < 2.0:
+                    last[rel] = v; continue   # endringen kom fra vennen via delt teller – ikke Link 2
                 if old is not None and 0 <= old - v <= 3 and v < old and now - getattr(self, '_am_btn_t', 0) > 4.0:   # 4 s: sikting med sprettert kan ta tid
                     self.p.write(self.p.base + self.rupees.off + rel, struct.pack('<I', old))
                     log(f'ammo: Link 2 brukte {old - v} {nm} – gitt tilbake ({v} -> {old})')
@@ -7501,7 +8010,7 @@ class App:
                     self.chat_var.set(t); self._send_chat()
                 self.ui(run)
 
-    INFO_CMDS = ('/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
+    INFO_CMDS = ('/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
 
     def _info_cmd(self, line):
         """Info-kommandoer (svar i chat og logg). Brukes også fra chatten."""
@@ -7516,6 +8025,12 @@ class App:
             elif cmd == '/skip':
                 SKIP.clear(); SKIP.update(x for x in (line.split()[1] if len(line.split()) > 1 else '').split(',') if x)
                 out.append(f'hopper over: {sorted(SKIP)}'); log(f'skip: {sorted(SKIP)}')
+            elif cmd == '/blinkmode':   # /blinkmode 40 | all
+                self.pad.blink_mode = (line.split()[1] if len(line.split()) > 1 else 'all')
+                self.pad.__dict__.get('_pup_blink_addrs', {}).clear()
+                out.append(f'blinkmodus: {self.pad.blink_mode}')
+            elif cmd == '/paint':   # v0.94.262: AV – adressesøk med F_LD8 på ugyldig adresse frøs spillet (se HANDOVER)
+                out.append('maling er slått av (frøs spillet) – egen farge byttes ved neste omstart')
             elif cmd == '/ping':
                 out.append('pong')
             elif cmd == '/pvpflags':   # /pvpflags 10771,11111 – hvilke boss-flagg som holdes av i PvP (i tillegg til dørflaggene)
@@ -7589,7 +8104,16 @@ class App:
                     out.append(f'server: nåværende lag={self._active_pvp_team()} (bruk Blue|Red|Spectate)')
             elif cmd == '/inv':
                 if getattr(self, 'mode', 'Story') != 'PvP':
-                    out.append('pvp-db: PvP-inventar brukes kun i PvP-modus')
+                    sub = line.split()[1:]
+                    if sub and sub[0].lower() == 'load':
+                        self._inv_load_pending = time.time()
+                        self._server_cmd('inv_get')
+                        out.append(f'inv-db: henter lagret Story-inventar for {self.name} fra serveren …')
+                    else:
+                        last = getattr(self, '_sinv_last', None)
+                        out.append(f'inv-db ({self.name}): lagres automatisk på serveren hvert 5. s ved endring. '
+                                   f'Sist sendt: ' + (', '.join(f'{k}={v}' for k, v in last.items() if k != 'bag') + f", {len(last.get('bag') or {})} bag-poster" if last else 'ingenting ennå')
+                                   + ' | /inv load = hent tilbake')
                 else:
                     pr = getattr(self, '_pvp_profile', None)
                     if not pr:
@@ -8156,6 +8680,8 @@ class App:
                 self._pvp_profile_applied = False
                 self._pvp_inv_last = None
                 if isinstance(sv, dict):
+                    for sync in (getattr(self, 'syncs', None) or {}).values():
+                        sync.mute(3.0)   # v0.94.268: tilbakeskrivingen er ikke et funn/forbruk – ellers sendes den som delta til vennen
                     for key, rel, _cap_rel in self.PVP_INV_RELS:
                         if key in sv and isinstance(sv[key], int):
                             val = max(0, sv[key])
@@ -8165,6 +8691,9 @@ class App:
                     for sync in (getattr(self, 'syncs', None) or {}).values():
                         sync.expected = p.u32(sync.off)
                     log(f'pvp-db: Story-inventar lagt tilbake {sv}')
+                if self.cfg.get('server_inventory', True):   # v0.94.278: serveren er fasit for Story – hent derfra, ikke fra lokalt øyeblikksbilde
+                    self._sinv_loaded = False; self._inv_load_pending = time.time(); self._server_cmd('inv_get')
+                    log('inv-db: tilbake i Story – henter inventaret fra serveren')
         except Exception as e:  # noqa: BLE001
             log(f'pvp-db: modusbytte-feil {e!r}')
 
@@ -10691,6 +11220,17 @@ class App:
                                 out.append([self._gone_seq, banc, nm, [round(v, 1) for v in last]])
                                 del out[:-30]
                                 log(f'aktør: {nm} borte her ved {tuple(round(v) for v in last)} – sender til vennen')
+                # v0.94.268: vår kopi ble drept fordi vennen drepte fienden -> spillet ruller sin egen drop her også.
+                # Vennens drop er den ekte (plukkes den opp, deles beløpet via de delte tellerne). Slett vår ekstra.
+                kz = self.__dict__.setdefault('_kill_zones', [])
+                kz[:] = [z for z in kz if now - z[1] < 8.0 and z[2] == banc]
+                if kz:
+                    for a, (nm, pos) in list(cur.items()):
+                        if a in track or nm not in pad.DROP_NAMES:
+                            continue
+                        if any(math.dist(pos, z[0]) < 4.0 for z in kz):
+                            r_ = pad.delete_actor(p, a); cur.pop(a, None)
+                            log(f'loot: slettet ekstra {nm} ved synket drap (vennen har den ekte) -> {r_}')
                 for a, (nm, pos) in cur.items():
                     if a in track:
                         track[a] = (nm, track[a][1], pos)
@@ -10713,6 +11253,7 @@ class App:
                         if ad:   # drep med liv 0: spillets egen død (dropp, animasjon) – tryggere enn sletting
                             try:
                                 p.write(p.base + ad[0], struct.pack('<I', 0)); r = 'liv 0'
+                                self.__dict__.setdefault('_kill_zones', []).append((tuple(track[best[1]][2]), now, banc))
                             except OSError:
                                 r = pad.delete_actor(p, best[1])
                         else:
@@ -10770,8 +11311,10 @@ class App:
         srv_st = getattr(self, '_server_state', None) or {}
         srv_dt = srv_st.get('day_time') if now - getattr(self, '_server_seen', 0) < 5.0 else None
         srv_time = int(float(srv_dt)) % 86400 if isinstance(srv_dt, (int, float)) else None
+        srv_ww = srv_st.get('weather') if now - getattr(self, '_server_seen', 0) < 5.0 else None
+        srv_ww = int(srv_ww) if isinstance(srv_ww, int) and 0 <= srv_ww < len(PadLink.WEATHERS) else None
         fw = srv_time if srv_time is not None else ((self.friend or {}).get('wtime') if fresh and not pvp else None)
-        fww = (self.friend or {}).get('wweather') if fresh and not pvp else None
+        fww = srv_ww if srv_ww is not None else ((self.friend or {}).get('wweather') if fresh and not pvp else None)
         def run():
             try:
                 if self.pad.hR is not None and not pvp:
@@ -10779,18 +11322,14 @@ class App:
                     self._server_clock_active = False
                 mine = self.pad.read_time(self.p); self._my_wtime = mine
                 mw = self.pad.read_weather(self.p); self._my_wweather = mw
-                if not host and fww is not None and mw is not None and fww != mw and time.time() - getattr(self, '_ww_set_t', 0) > 15:
+                if (srv_ww is not None or not host) and fww is not None and mw is not None and fww != mw and time.time() - getattr(self, '_ww_set_t', 0) > 15:
                     self._ww_set_t = time.time()
                     first = not getattr(self, '_ww_synced', False); self._ww_synced = True
                     if self.pad.write_weather(self.p, fww, 0 if first else 5):
-                        log(f'vær: satt til vertens {PadLink.WEATHERS[fww]} (var {PadLink.WEATHERS[mw]})')
+                        log(f'vær: satt til {"serverens" if srv_ww is not None else "vertens"} {PadLink.WEATHERS[fww]} (var {PadLink.WEATHERS[mw]})')
                 if mine is not None:
-                    if srv_time is not None:
-                        rolle = 'World server'
-                    else:
-                        rolle = 'waiting for server' if pvp else ('host' if host else ('following host' if fw is not None else 'waiting for host'))
                     vtxt = {0: 'sunny', 1: 'rain', 2: 'snow', 3: 'storm', 4: 'cloudy'}.get(mw, '?')
-                    self.set_check('clock', 'ok', f'{mine // 3600:02d}:{mine % 3600 // 60:02d} {vtxt} ({rolle})')
+                    self.set_check('clock', 'ok', f'{mine // 3600:02d}:{mine % 3600 // 60:02d} {vtxt}')
                 else:
                     self.set_check('clock', 'off', 'unknown')
                 if fw is not None and mine is not None and (srv_time is not None or (not pvp and not host)):
@@ -10966,8 +11505,9 @@ class App:
                         _prev_low = prev_low_map.get(_p_act, False)
                         if _f_low or _prev_low:
                             prev_low_map[_p_act] = _f_low
-                            _b_val = (0.74 * ((0.5 + 0.5 * math.sin(now * 3.5)) ** 2)) if _f_low else 0.0
-                            pad.set_puppet_low_hp_blink(p, _p_act, _b_val)
+                            _blink_due = self.__dict__.setdefault('_pup_blink_due', {})
+                            # v0.94.259: egen tråd skriver ~120 Hz (spillet skriver tilbake hvert bilde -> 10 Hz ga flimmer)
+                            pad.blink_set_target(p, _p_act, False)   # v0.94.267: 3D lav-HP-blink på dukker droppet (brukeren) – nullstill bare
             except Exception:  # noqa: BLE001
                 pass
 
@@ -11568,8 +12108,8 @@ class App:
                 if not (isinstance(pos, list) and len(pos) == 3 and
                         all(isinstance(v, (int, float)) and abs(v) <= 1e5 for v in pos)):
                     continue
-                color = peer.get('team') or peer.get('model')
-                model = color if color in ('Red', 'Blue', 'Pink') else 'Green'
+                color = (peer.get('team') if is_pvp else None) or peer.get('model')
+                model = color if color in LOOKS else 'Green'
                 anim = peer.get('anim') if isinstance(peer.get('anim'), str) else ''
                 bones = peer.get('bones') if isinstance(peer.get('bones'), str) else ''
                 if name == friend_name and isinstance(friend_bones, str) and friend_bones:
@@ -11585,13 +12125,16 @@ class App:
                 seen.add(name)
                 if len(peers) >= self.pad.PUPPET_MAX - 1:
                     break
+        server_fresh = now - getattr(self, '_server_seen', 0) < 5
+        channel_names = (getattr(self, '_server_state', {}) or {}).get('present') or []
         if (puppets and not is_pvp and zone and friend_obj.get('banc') == zone
+                and (not server_fresh or friend_name in channel_names)
                 and isinstance(friend_name, str) and friend_name and friend_name not in seen
                 and isinstance(friend_apos, list) and len(friend_apos) == 3
                 and all(isinstance(v, (int, float)) and abs(v) <= 1e5 for v in friend_apos)
                 and len(peers) < self.pad.PUPPET_MAX - 1):
             model = friend_obj.get('look')
-            if model not in ('Red', 'Blue', 'Pink'):
+            if model not in LOOKS:
                 model = 'Green'
             anim = friend_obj.get('anim')
             peers.append((friend_name, f'CoopPuppet_{model}', tuple(friend_apos), friend_yaw or 0.0,
@@ -11630,6 +12173,8 @@ class App:
             pass
         if 'boss' not in sk:
             self._boss_tick_async(now)
+        self._self_tunic_tick(now)
+        self._story_inv_tick(now)
         for nm in ('enemy', 'floor', 'box', 'weapon', 'death', 'pvp', 'bot', 'remote'):
             if nm not in sk or nm == 'remote':
                 getattr(self, f'_{nm}_tick')(now)
@@ -11845,6 +12390,7 @@ class App:
                    "pos": list(me[:3]), "face": list(me[3:]),
                    "apos": self.pad.my_apos(self.p), "arot": self.pad.my_arot(self.p), "cam_a": my_cam_a,
                    "hearts": my_hearts,
+                   "follow": bool(getattr(self, 'tvang', False)),
                    "ev": self.pad.read_active_event(self.p) if getattr(self, 'mode', 'Story') == 'Story' else None,
                    "dan": getattr(self, '_my_death_an', None),
                    "mode": getattr(self, 'mode', 'Story'),
@@ -11852,7 +12398,7 @@ class App:
                    "pvpd": getattr(self, '_pvp_deaths', 0),
                    "ctfl": [t for t, lit in getattr(self, '_ctf_lit', {}).items() if lit],
                    "cum": self.rupees.my_cum, "rupees": vals.get("rupees"),   # v0.4-kompatibelt
-                   "cums": {n: c.my_cum for n, c in self.syncs.items()}, "vals": vals,
+                   "cums": {n: c.my_cum for n, c in self.syncs.items()}, "vals": vals, "ce": getattr(self, 'cnt_epoch', 0),
                    "bag": bag_vals, "bag_cums": bag_cums,
                    "bag_delta": sorted(self.bag.delta) if getattr(self, "bag", None) else [],
                    "bag_ignored": sorted(self.bag.ignored) if getattr(self, "bag", None) else [],
@@ -11895,6 +12441,14 @@ class App:
                 pass
         self._drain_udp(now)
         alive = bool(self.friend and now - self.friend_t < 2) and self._server_says_friend_present(now)
+        roster = (getattr(self, '_server_state', None) or {}).get('roster') or []
+        follow_locked = follow_locked_by_peer(self.friend if alive else None, roster, self.name)
+        if follow_locked != getattr(self, '_follow_remote_locked', None):
+            self._follow_remote_locked = follow_locked
+            self.follow_cb.config(state=('disabled' if follow_locked else 'normal'),
+                                  disabledforeground=MUTED, fg=(MUTED if follow_locked else FG))
+            if follow_locked:
+                log('FOLLOW: låst fordi en annen spiller har aktivert det')
         if alive:
             self._maybe_send_assets()
         if self.p is not None and 'pad' not in SKIP:

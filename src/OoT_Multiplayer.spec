@@ -4,7 +4,7 @@
 a = Analysis(
     ['D:/Switch2/mod/oot_mp_gui.py'],
     pathex=[],
-    binaries=[],
+    binaries=[('D:/Switch2/mod/oot_rust_engine.dll', '.')],
     datas=[],
     hiddenimports=[],
     hookspath=[],

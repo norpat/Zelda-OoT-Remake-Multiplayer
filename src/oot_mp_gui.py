@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.290"
+VERSION = "0.94.291"
 
 
 def puppet_low_hp_pulse(now):
@@ -5760,7 +5760,8 @@ class App:
             if st['pool']:
                 st['owner'][nm] = st['pool'].pop()
                 continue
-            if (not st['busy'] and st['spawns'] < self.FAIRY_MAX and now - st['spawn_t'] > 4.0
+            if (not st['busy'] and not self.__dict__.get('_glyph', {}).get('busy')   # v0.94.291: aldri to create_actor samtidig
+                  and st['spawns'] < self.FAIRY_MAX and now - st['spawn_t'] > 4.0
                   and not (st.get('miss') and now - st['spawn_t'] < 10.0)):   # forrige fant ingen: gi den tid til å dukke opp
                 st['busy'] = True; st['spawn_t'] = now; st['spawns'] += 1
                 try:
@@ -5819,6 +5820,146 @@ class App:
                     st['parked'].add(a)
                 except OSError:
                     pass
+
+    # ------------------------------------------------------------------ v0.94.291: navneskilt i spillet
+    # Én aktør per tegn: CoopGlyph_<A-Z/0-9> (tools/glyph_pack.py) = Kokiri-treskiltet skalert til 1/4 via rotbeinet i
+    # modellen, med egen tekstur (hvit bokstav på mørk flate). Et navn = en rad slike skilt over hodet til dukken,
+    # snudd mot kameraet og flyttet via fysikk-kroppen som feene. Samme regler som feene: aldri lage under sonelasting,
+    # aldri flytte en død aktør, aldri slette (ledige parkeres under bakken). Krever omstart av spillet etter pakking.
+    GLYPH_PREFIX = 'CoopGlyph_'
+    GLYPH_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
+    GLYPH_MAX = 48            # tegn-aktører per sone
+    GLYPH_W = 0.24            # avstand mellom tegnene (skiltbredde 1,0 m x beinskala 0,25)
+    GLYPH_H = 1.25            # skiltfoten over dukkens føtter (skiltflaten ~0,2–0,34 m over foten)
+
+    def _glyph_ok(self, ch):
+        have = self.__dict__.setdefault('_glyph_have', {})
+        if ch not in have:
+            have[ch] = os.path.isfile(os.path.join(TUNIC_DIR, 'romfs', 'Pack', 'Actor', f'{self.GLYPH_PREFIX}{ch}.pack.zs'))
+        return have[ch] and ch not in self.__dict__.setdefault('_glyph_bad', set())
+
+    def _plate_text(self, nm):
+        return ''.join(c for c in str(nm).upper() if c in self.GLYPH_CHARS and self._glyph_ok(c))[:10]
+
+    def _coop_nameplates(self, p, now, entries, zone):
+        pad = self.pad
+        st = self.__dict__.setdefault('_glyph', {'zone': None})
+        if not self.cfg.get('nameplates', True) or getattr(self, 'mode', 'Story') != 'Story':
+            entries = ()   # slått av / PvP: alle tegn tilbake i bassenget og parkeres (under)
+            if not st.get('owner'):
+                return
+        if st.get('zone') != zone:
+            st.clear(); st.update(zone=zone, free={}, owner={}, parked=set(), busy=False, spawn_t=0.0, spawns=0, known=None)
+        if (not pad.cur_banc or now - getattr(pad, '_banc_since', now) < 12.0 or now < getattr(pad, '_tp_t', 0) + 8.0
+                or not pad._zone_ready(p, now)):
+            return
+        names = {e[0]: e[1] for e in entries}
+        if st['known'] is None:
+            # tegn som finnes fra før (forrige modd-start i samme spill/sone) gjenbrukes
+            if not names or pad.event_busy(p) is not None:
+                return
+            st['known'] = set()
+            n_ = 0
+            for ch in {c for nm in names for c in self._plate_text(nm)}:
+                for a0 in (pad._list_actors_raw(p, prefix=self.GLYPH_PREFIX + ch) or {}):
+                    x0 = pad.actor_x8(p, a0)
+                    if x0 and pad.navi_ready(p, a0, x0):
+                        st['free'].setdefault(ch, []).append((a0, x0)); n_ += 1
+                    st['known'].add(a0)
+            if n_:
+                log(f'navneskilt: gjenbruker {n_} tegn som fantes fra før')
+        for nm in list(st['owner']):   # spilleren er borte eller navnet endret: tegnene tilbake i bassenget
+            if nm not in names or st['owner'][nm]['text'] != self._plate_text(nm):
+                for sl in st['owner'].pop(nm)['slots']:
+                    if sl:
+                        st['free'].setdefault(sl[0], []).append(sl[1:])
+        for nm in names:
+            txt = self._plate_text(nm)
+            if not txt:
+                continue
+            o = st['owner'].setdefault(nm, {'text': txt, 'slots': [None] * len(txt)})
+            for i, ch in enumerate(txt):
+                if o['slots'][i] is not None:
+                    continue
+                if st['free'].get(ch):
+                    o['slots'][i] = (ch,) + st['free'][ch].pop()
+                    continue
+                fairy_busy = self.__dict__.get('_fairy', {}).get('busy')
+                if st['busy'] or fairy_busy or st['spawns'] >= self.GLYPH_MAX or now - st['spawn_t'] < 1.5:
+                    continue
+                try:
+                    lp = p.f32(names[nm] + 0x31C, 3)
+                except OSError:
+                    continue
+                st['busy'] = True; st['spawn_t'] = now; st['spawns'] += 1
+
+                def _spawn(ch=ch, pos=(lp[0], lp[1] - 3.0, lp[2])):
+                    try:
+                        r = pad.create_actor(p, self.GLYPH_PREFIX + ch, list(pos))
+                        if not r:   # spillet kjenner ikke aktøren (pakket etter spillstart)
+                            self.__dict__.setdefault('_glyph_bad', set()).add(ch); st['spawns'] -= 1
+                            log(f'navneskilt: {self.GLYPH_PREFIX}{ch} kunne ikke lages – start spillet på nytt etter pakking')
+                            return
+                        time.sleep(1.0)
+                        found = pad._list_actors_raw(p, prefix=self.GLYPH_PREFIX + ch) or {}
+                        mine = {sl[1] for o_ in st['owner'].values() for sl in o_['slots'] if sl} | {a for v in st['free'].values() for a, _ in v}
+                        new = [a for a in found if a not in st['known'] and a not in mine]
+                        for a in new:
+                            st['known'].add(a)
+                            x8 = pad.actor_x8(p, a)
+                            if x8 and pad.navi_ready(p, a, x8):
+                                st['free'].setdefault(ch, []).append((a, x8))
+                        log(f'navneskilt: laget {self.GLYPH_PREFIX}{ch} -> {r}, {len(new)} ny(e)')
+                    except Exception as e:  # noqa: BLE001
+                        log(f'navneskilt: spawn-feil {e!r}')
+                    finally:
+                        st['busy'] = False
+                threading.Thread(target=_spawn, daemon=True, name='GlyphSpawn').start()
+        # snu mot kameraet (øyet), ellers mot egen Link
+        eye = None
+        try:
+            if getattr(self, 'cam_off', None) is not None:
+                eye = read_cam(p, self.cam_off)[3]
+            if eye is None or not all(math.isfinite(v) for v in eye):
+                eye = p.f32(pad.p_act + 0x31C, 3)
+        except (OSError, TypeError):
+            eye = None
+        yoff = math.radians(float(self.cfg.get('glyph_yaw_off', 0)))
+        for nm, o in st['owner'].items():
+            if nm not in names:
+                continue
+            try:
+                lp = p.f32(names[nm] + 0x31C, 3)
+            except OSError:
+                continue
+            base = (lp[0], lp[1] + float(self.cfg.get('glyph_height', self.GLYPH_H)), lp[2])
+            yaw = math.atan2(eye[0] - base[0], eye[2] - base[2]) if eye else 0.0
+            yaw += yoff
+            rx, rz = math.cos(yaw), -math.sin(yaw)   # skiltets +X (leseretning) i verden
+            n_ = len(o['slots'])
+            for i, sl in enumerate(o['slots']):
+                if not sl:
+                    continue
+                ch, a, x8 = sl
+                if not pad.navi_ready(p, a, x8):   # død aktør flyttes aldri
+                    o['slots'][i] = None; continue
+                k = (i - (n_ - 1) / 2) * self.GLYPH_W
+                self._fairy_move(p, a, x8, (base[0] + rx * k, base[1], base[2] + rz * k), yaw)
+                st['parked'].discard(a)
+        for ch, lst in st['free'].items():   # ledige tegn parkeres 6 m under bakken
+            for a, x8 in lst:
+                if a not in st['parked'] and pad.navi_ready(p, a, x8):
+                    try:
+                        lp = p.f32(a + 0x31C, 3)
+                        self._fairy_move(p, a, x8, (lp[0], lp[1] - 6.0, lp[2]))
+                        st['parked'].add(a)
+                    except OSError:
+                        pass
+        if now - st.get('log_t', 0) > 15 and st['owner']:
+            st['log_t'] = now
+            log('navneskilt: ' + ', '.join(f"{nm} '{o['text']}' {sum(1 for s in o['slots'] if s)}/{len(o['slots'])}"
+                                           for nm, o in st['owner'].items())
+                + f" | ledige {sum(len(v) for v in st['free'].values())}, laget {st['spawns']}")
 
     def _tvang_toggled(self):
         self.tvang = bool(self.tvang_var.get()); self.cfg["tvang"] = self.tvang; save_cfg(self.cfg)
@@ -8254,7 +8395,7 @@ class App:
                     self.chat_var.set(t); self._send_chat()
                 self.ui(run)
 
-    INFO_CMDS = ('/zone', '/spawn', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
+    INFO_CMDS = ('/zone', '/spawn', '/plates', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
 
     def _info_cmd(self, line):
         """Info-kommandoer (svar i chat og logg). Brukes også fra chatten."""
@@ -8300,11 +8441,12 @@ class App:
                     out.append('bruk: /spawn <navn> [høyde]')
                 else:
                     nm_, dy_ = parts[1], (float(parts[2]) if len(parts) > 2 else 1.2)
+                    sc_ = float(parts[3]) if len(parts) > 3 else 1.0   # v0.94.291: /spawn <navn> [høyde] [skala]
                     lp_ = self.p.f32(self.pad.p_act + 0x31C, 3)
                     pos_ = [lp_[0] + 1.0, lp_[1] + dy_, lp_[2] + 1.0]
-                    def _sp(nm_=nm_, pos_=pos_):
-                        r_ = self.pad.create_actor(self.p, nm_, pos_)
-                        log(f'spawn-test: {nm_} ved {[round(v, 1) for v in pos_]} -> {r_}')
+                    def _sp(nm_=nm_, pos_=pos_, sc_=sc_):
+                        r_ = self.pad.create_actor(self.p, nm_, pos_, scale=sc_)
+                        log(f'spawn-test: {nm_} ved {[round(v, 1) for v in pos_]} skala {sc_} -> {r_}')
                         for t_ in (1.0, 3.0, 8.0):
                             time.sleep(t_)
                             f_ = self.pad._list_actors_raw(self.p, prefix=nm_) or {}
@@ -8317,6 +8459,11 @@ class App:
                 out.append(f'blinkmodus: {self.pad.blink_mode}')
             elif cmd == '/paint':   # v0.94.262: AV – adressesøk med F_LD8 på ugyldig adresse frøs spillet (se HANDOVER)
                 out.append('maling er slått av (frøs spillet) – egen farge byttes ved neste omstart')
+            elif cmd == '/plates':   # v0.94.291: /plates on|off – navneskilt over de andre spillerne
+                v = (line.split()[1].lower() if len(line.split()) > 1 else '')
+                if v in ('on', 'off', 'på', 'av'):
+                    self.cfg['nameplates'] = v in ('on', 'på'); save_cfg(self.cfg)
+                out.append(f"navneskilt: {'på' if self.cfg.get('nameplates', True) else 'av'}")
             elif cmd == '/ping':
                 out.append('pong')
             elif cmd == '/pvpflags':   # /pvpflags 10771,11111 – hvilke boss-flagg som holdes av i PvP (i tillegg til dørflaggene)
@@ -11793,6 +11940,11 @@ class App:
                 except Exception as e_f:  # noqa: BLE001
                     if now - getattr(self, '_fairy_err_t', 0) > 10:
                         self._fairy_err_t = now; log(f'fe: feil {e_f!r}')
+                try:   # v0.94.291: navneskilt over dukkene
+                    self._coop_nameplates(p, now, active_entries, zone)
+                except Exception as e_g:  # noqa: BLE001
+                    if now - getattr(self, '_glyph_err_t', 0) > 10:
+                        self._glyph_err_t = now; log(f'navneskilt: feil {e_g!r}')
                 if active_entries:
                     self._animate_puppets(p, now, active_entries, {})
                     # v0.94.244: 3D rød lav-HP-blinking på alle 24 MaterialObj-buffere (+ dirty-flagg 0x0101) på CoopPuppet når spilleren har <= 1 hjerte

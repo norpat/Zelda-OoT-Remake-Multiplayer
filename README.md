@@ -14,6 +14,7 @@ Each player runs the game on their own Windows PC in the Lichii emulator. The mo
 - **PvP (work in progress):** Lobby in Bombchu Bowling Alley with *Capture the Flame* and *Deathmatch* modes, team selection, shop counter, and a Radio Jukebox in the PvP menu.
 - **Player puppets & animations:** Supports up to 50 players in the same zone using lightweight actor puppets (`CoopPuppet_*`) with real-time skeleton bone sync.
 - **Navi for every player:** Each remote player's puppet gets its own fairy (cutscene Navi actor) circling it; works across zone changes. Turn off with `coop_fairies: false` in the config.
+- **Nameplates in the game world:** Each remote player's name floats above their puppet as a row of small wooden signs, one per character (A–Z, 0–9), always turned toward your camera (Story mode). Toggle with `/plates on|off`. Needs the `CoopGlyph_*` actors in the romfs mod and a game restart after they are added.
 - **Accounts:** Optional password per player name protects your server-side inventory and PvP profile.
 - **Chat commands:** e.g. `/zone <scene> [start]` to travel to a scene (boss rooms blocked).
 - **Zelda-styled GUI:** Shows game/network status, connected players, PvP lobby controls, and an in-app chat.

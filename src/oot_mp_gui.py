@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.284"
+VERSION = "0.94.285"
 
 
 def puppet_low_hp_pulse(now):
@@ -5292,6 +5292,13 @@ class App:
         e = ttk.Entry(top_in, textvariable=self.name_var, width=14); e.pack(side="left", padx=(6, 16))
         e.bind("<FocusOut>", lambda _e: self._save_name())
         e.bind("<Return>", lambda _e: self._save_name())
+        # v0.94.285: passord for navnet (beskytter inventaret på serveren). Bare en avledet nøkkel lagres/sendes.
+        tk.Label(top_in, text="🔒", bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(side="left")
+        self.pw_var = tk.StringVar()
+        self.pw_entry = ttk.Entry(top_in, textvariable=self.pw_var, width=10, show="•")
+        self.pw_entry.pack(side="left", padx=(2, 14))
+        self.pw_entry.bind("<Return>", lambda _e: self._save_password())
+        self.pw_entry.bind("<FocusOut>", lambda _e: self._save_password())
         # Utseende: gjelder egen Link og hvordan vennen ser deg. Fargen beholdes internt (chat/markør).
         self.color_dot = tk.Label(top_in, text="●", fg=HAT_COLORS[self.hat_color], bg=PANEL, font=("Segoe UI", 13))
         self.color_var = tk.StringVar(value=self.hat_color)
@@ -5887,6 +5894,25 @@ class App:
         except OSError as e:
             log(f'tunika: romfs-kopiering feilet ({lk}): {e}')
             return False
+
+    def _account_key(self):
+        """Avledet nøkkel for nåværende navn (None = ingen passord satt)."""
+        return (self.cfg.get('account_keys') or {}).get(self.name)
+
+    def _save_password(self):
+        pw = self.pw_var.get()
+        if not pw:
+            return
+        import hashlib
+        key = hashlib.sha256(f"oot-mp-v1:{self.name.strip().lower()}:{pw}".encode()).hexdigest()
+        self.pw_var.set('')
+        keys = dict(self.cfg.get('account_keys') or {}); keys[self.name] = key
+        self.cfg['account_keys'] = keys; save_cfg(self.cfg)
+        self._sinv_denied = False
+        self._append_chat_sys(f'🔒 Password saved for {self.name}. Your inventory on the server is now tied to it.')
+        log(f'konto: passord satt for {self.name} (bare avledet nøkkel lagret)')
+        if getattr(self, 'mode', 'Story') == 'Story':   # hent på nytt med nøkkelen
+            self._sinv_loaded = False; self._inv_load_pending = time.time(); self._server_cmd('inv_get', key=key)
 
     def _save_look(self):
         lk = self.look_var.get()
@@ -6941,6 +6967,15 @@ class App:
             self._handle_presence(m)
             self._handle_server_chat(m.get('chat'))
             si_ = m.get('story_inv')
+            if isinstance(si_, dict) and si_.get('error') == 'wrong_password':
+                if not getattr(self, '_sinv_denied', False):
+                    self._sinv_denied = True; self._inv_load_pending = 0
+                    self._append_chat_sys(f'⛔ {self.name} has a password on the server – type it in the 🔒 field. Inventory is not loaded or saved until then.')
+                    log(f'konto: serveren avviste nøkkelen for {self.name} – inventar lastes/lagres ikke')
+                si_ = None
+            elif isinstance(si_, dict) and si_.get('account') == 'created' and not getattr(self, '_acct_note', False):
+                self._acct_note = True
+                self._append_chat_sys(f'🔒 The name {self.name} is now yours on the server.')
             if getattr(self, '_inv_load_pending', 0) and isinstance(si_, dict):
                 self._inv_load_pending = 0; self._sinv_loaded = True
                 if not si_.get('inv'):
@@ -7752,13 +7787,13 @@ class App:
         if getattr(self, '_sinv_rup', None) != self.rupees.off:     # nytt spill/tilkobling: vent 20 s før første lagring
             self._sinv_rup = self.rupees.off; self._sinv_ready = now + 20
             if self.cfg.get('server_inventory', True):   # ny tilkobling: hent eget inventar fra serveren
-                self._sinv_loaded = False; self._inv_load_pending = now; self._server_cmd('inv_get')
+                self._sinv_loaded = False; self._inv_load_pending = now; self._server_cmd('inv_get', key=self._account_key())
                 log(f'inv-db: henter Story-inventar for {self.name} fra serveren (tilkobling)')
             return
         if self.cfg.get('server_inventory', True) and not getattr(self, '_sinv_loaded', True):
             # ikke lagre før serveren har svart (ellers kunne spillets lagringsfil overskrive serverens inventar)
             if now - (getattr(self, '_inv_load_pending', 0) or 0) > 10:
-                self._inv_load_pending = now; self._server_cmd('inv_get')
+                self._inv_load_pending = now; self._server_cmd('inv_get', key=self._account_key())
             return
         if now < getattr(self, '_sinv_ready', 0) or now - (getattr(self, '_inv_load_pending', 0) or 0) < 10:
             return
@@ -7773,7 +7808,9 @@ class App:
             if ch or nb:
                 big = any(k == 'rupees' and isinstance(last_.get(k), int) and v - last_[k] > 200 for k, v in inv.items())
                 log(f"inv-db: endring {', '.join(ch)}{f' (+{nb} bag-poster)' if nb else ''}{' – MISTENKELIG STOR ØKNING' if big else ''}")
-        if inv != getattr(self, '_sinv_last', None) and self._server_cmd('inv_save', inv=inv):
+        if getattr(self, '_sinv_denied', False):   # feil passord: ikke prøv å lagre (serveren avviser uansett)
+            return
+        if inv != getattr(self, '_sinv_last', None) and self._server_cmd('inv_save', inv=inv, key=self._account_key()):
             self._sinv_last = inv
 
     def _story_inv_apply(self, inv):
@@ -8229,7 +8266,7 @@ class App:
                     sub = line.split()[1:]
                     if sub and sub[0].lower() == 'load':
                         self._inv_load_pending = time.time()
-                        self._server_cmd('inv_get')
+                        self._server_cmd('inv_get', key=self._account_key())
                         out.append(f'inv-db: henter lagret Story-inventar for {self.name} fra serveren …')
                     else:
                         last = getattr(self, '_sinv_last', None)
@@ -8814,7 +8851,7 @@ class App:
                         sync.expected = p.u32(sync.off)
                     log(f'pvp-db: Story-inventar lagt tilbake {sv}')
                 if self.cfg.get('server_inventory', True):   # v0.94.278: serveren er fasit for Story – hent derfra, ikke fra lokalt øyeblikksbilde
-                    self._sinv_loaded = False; self._inv_load_pending = time.time(); self._server_cmd('inv_get')
+                    self._sinv_loaded = False; self._inv_load_pending = time.time(); self._server_cmd('inv_get', key=self._account_key())
                     log('inv-db: tilbake i Story – henter inventaret fra serveren')
         except Exception as e:  # noqa: BLE001
             log(f'pvp-db: modusbytte-feil {e!r}')

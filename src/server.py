@@ -4,7 +4,10 @@ JSON-meldinger: hello, create (size=4/10), join (lobby), team, ready,
 start, score og spectate. Hver klient får egen lobbytilstand, serverklokke,
 rundetid og listen over tilgjengelige spill. Story bruker ikke denne tjenesten.
 """
+import hashlib
+import hmac
 import http.server
+import os
 import json
 import math
 import socket
@@ -72,6 +75,9 @@ class ZeldaServer:
         )
         self.db.execute(   # v0.94.268: eget Story-inventar per spiller (navn), lagret som JSON
             "create table if not exists story_inventory(name text primary key, data text not null, updated real not null)"
+        )
+        self.db.execute(   # v0.94.285: konto per spillernavn. Lagrer bare salt + PBKDF2 av klientens avledede nøkkel (aldri passordet).
+            "create table if not exists accounts(name text primary key, salt blob not null, hash blob not null, created real not null)"
         )
         self.db.execute(
             "create table if not exists transactions("
@@ -301,6 +307,31 @@ class ZeldaServer:
         else:
             hp[target] = remaining
         return None
+
+    def check_account(self, name, key, now):
+        """v0.94.285: «open» = navnet har ingen konto og ingen nøkkel ble sendt; «created» = første nøkkel tar navnet;
+        «ok» = riktig nøkkel; «denied» = navnet har konto og nøkkelen mangler eller er feil."""
+        key = key if isinstance(key, str) and 16 <= len(key) <= 128 else None
+        cache = self.__dict__.setdefault("_auth_ok", {})   # navn -> sha256(nøkkel) som allerede er sjekket (PBKDF2 er treg)
+        if key is not None and cache.get(name) == hashlib.sha256(key.encode()).digest():
+            return "ok"
+        row = self.db.execute("select salt, hash from accounts where name=?", (name,)).fetchone()
+        if row is None:
+            if key is None:
+                return "open"
+            salt = os.urandom(16)
+            digest = hashlib.pbkdf2_hmac("sha256", key.encode(), salt, 200_000)
+            self.db.execute("insert into accounts(name,salt,hash,created) values(?,?,?,?)", (name, salt, digest, now))
+            self.db.commit()
+            cache[name] = hashlib.sha256(key.encode()).digest()
+            return "created"
+        if key is None:
+            return "denied"
+        digest = hashlib.pbkdf2_hmac("sha256", key.encode(), row[0], 200_000)
+        if hmac.compare_digest(digest, row[1]):
+            cache[name] = hashlib.sha256(key.encode()).digest()
+            return "ok"
+        return "denied"
 
     def handle(self, message, addr, now=None, *, reply_to_pose=True):
         with self.lock:
@@ -535,12 +566,17 @@ class ZeldaServer:
             self.consume_inventory(name, message.get("items") or {}, now)
         elif kind == "inv_save":   # v0.94.268: lagre eget Story-inventar (siste versjon vinner)
             inv = message.get("inv")
-            if isinstance(inv, dict) and len(json.dumps(inv)) <= 16384:
+            auth = self.check_account(name, message.get("key"), now)
+            player["_auth"] = auth
+            if auth == "denied":
+                player["_send_inv_until"] = now + 3.0   # svaret bærer feilen
+            elif isinstance(inv, dict) and len(json.dumps(inv)) <= 16384:
                 self.db.execute("insert into story_inventory(name,data,updated) values(?,?,?) "
                                 "on conflict(name) do update set data=excluded.data, updated=excluded.updated",
                                 (name, json.dumps(inv, sort_keys=True), now))
                 self.db.commit()
         elif kind == "inv_get":
+            player["_auth"] = self.check_account(name, message.get("key"), now)
             player["_send_inv_until"] = now + 3.0   # svaret går med de neste state-pakkene i 3 s
 
         # Tomme private Story-kanaler ryddes bort etter nøyaktig 10 minutter.
@@ -617,8 +653,12 @@ class ZeldaServer:
                                   and (player.get("mode") != "Story" or p.get("lobby") == player.get("lobby")))
         story_inv = None
         if now < player.get("_send_inv_until", 0):
-            row = self.db.execute("select data, updated from story_inventory where name=?", (name,)).fetchone()
-            story_inv = {"inv": json.loads(row[0]), "updated": row[1]} if row else {"inv": None, "updated": None}
+            if player.get("_auth") == "denied":
+                story_inv = {"inv": None, "updated": None, "error": "wrong_password"}
+            else:
+                row = self.db.execute("select data, updated from story_inventory where name=?", (name,)).fetchone()
+                story_inv = {"inv": json.loads(row[0]), "updated": row[1]} if row else {"inv": None, "updated": None}
+                story_inv["account"] = player.get("_auth") or "open"
         return {"t": "state", "story_inv": story_inv, "score": lobby["score"], "round": lobby["round"],
                 "players": {n: p["team"] for n, p in members.items()},
                 "members": [{"name": n, "team": p["team"], "ready": p["ready"],

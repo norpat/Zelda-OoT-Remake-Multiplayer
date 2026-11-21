@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.283"
+VERSION = "0.94.284"
 
 
 def puppet_low_hp_pulse(now):
@@ -11613,13 +11613,13 @@ class App:
                                     except OSError:
                                         pass
                 pad.publish_puppet_pose_owners(p, tuple(owners[:pad.PUPPET_MAX]))
+                try:   # v0.94.284: også uten aktive dukker – ellers ble feen hengende i lufta der spilleren forsvant
+                    self._coop_fairies(p, now, active_entries, zone)
+                except Exception as e_f:  # noqa: BLE001
+                    if now - getattr(self, '_fairy_err_t', 0) > 10:
+                        self._fairy_err_t = now; log(f'fe: feil {e_f!r}')
                 if active_entries:
                     self._animate_puppets(p, now, active_entries, {})
-                    try:
-                        self._coop_fairies(p, now, active_entries, zone)
-                    except Exception as e_f:  # noqa: BLE001
-                        if now - getattr(self, '_fairy_err_t', 0) > 10:
-                            self._fairy_err_t = now; log(f'fe: feil {e_f!r}')
                     # v0.94.244: 3D rød lav-HP-blinking på alle 24 MaterialObj-buffere (+ dirty-flagg 0x0101) på CoopPuppet når spilleren har <= 1 hjerte
                     prev_low_map = self.__dict__.setdefault('_pup_low_hp_prev_map', {})
                     for _it in active_entries:

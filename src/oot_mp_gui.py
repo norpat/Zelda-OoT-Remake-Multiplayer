@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.286"
+VERSION = "0.94.288"
 
 
 def puppet_low_hp_pulse(now):
@@ -8178,7 +8178,7 @@ class App:
                     self.chat_var.set(t); self._send_chat()
                 self.ui(run)
 
-    INFO_CMDS = ('/spawn', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
+    INFO_CMDS = ('/zone', '/spawn', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
 
     def _info_cmd(self, line):
         """Info-kommandoer (svar i chat og logg). Brukes også fra chatten."""
@@ -8193,6 +8193,28 @@ class App:
             elif cmd == '/skip':
                 SKIP.clear(); SKIP.update(x for x in (line.split()[1] if len(line.split()) > 1 else '').split(',') if x)
                 out.append(f'hopper over: {sorted(SKIP)}'); log(f'skip: {sorted(SKIP)}')
+            elif cmd == '/zone':   # v0.94.287: /zone <sone> [startpunkt] – ekte sonebytte som en dør (f.eks. /zone InsideTheDekuTree Entrance)
+                parts = line.split()
+                if len(parts) < 2 or not (self.p and self.pad.p_act is not None):
+                    out.append('bruk: /zone <sone> [startpunkt]  (f.eks. /zone InsideTheDekuTree Entrance)')
+                elif 'Boss' in parts[1]:
+                    out.append('zone: bossrom er sperret (spillet henger)')
+                else:
+                    banc_, start_ = parts[1], (parts[2] if len(parts) > 2 else ('Entrance' if parts[1] == 'InsideTheDekuTree' else None))
+                    r_ = False
+                    for _try in range(30):   # som PvP-byttet: vent til ingen hendelse kjører, prøv igjen (inntil ~60 s)
+                        pad_ = self.pad
+                        try:
+                            an_ = pad_.read_anim(self.p, pad_.p_act)[0] if pad_.p_act is not None else None
+                        except Exception:  # noqa: BLE001
+                            an_ = None
+                        if pad_.p_act is not None and an_ != 'EvtWait' and not pad_.event_busy(self.p) and time.time() - getattr(pad_, '_tp_t', 0) > 6.0:
+                            r_ = pad_.change_banc(self.p, banc_, start_)
+                            if r_:
+                                break
+                        time.sleep(2.0)
+                    log(f'zone: {banc_} @ {start_} -> {r_}')
+                    out.append(f'zone: {banc_} @ {start_} -> {r_}')
             elif cmd == '/spawn':   # v0.94.283 test: /spawn <aktørnavn> [høyde] – lager aktøren 1,5 m foran egen Link
                 parts = line.split()
                 if len(parts) < 2 or not (self.p and self.pad.p_act is not None):
@@ -12375,7 +12397,7 @@ class App:
                 and isinstance(self.friend, dict) and now - getattr(self, 'friend_t', 0) < 3.0
                 and self.pad.cur_banc and self.pad.cur_banc == self.pad.friend_banc):
             f_ev = self.friend.get("ev")
-            if isinstance(f_ev, str) and len(f_ev) >= 4 and not f_ev.startswith(self.pad.SYNC_EVENT_SKIP_PREFIXES) and 'BancChange' not in f_ev:
+            if isinstance(f_ev, str) and len(f_ev) >= 4 and not f_ev.startswith(self.pad.SYNC_EVENT_SKIP_PREFIXES) and not any(x_ in f_ev for x_ in ('BancChange', 'GameOver', 'Death', 'Dead')):   # v0.94.288: Delayed_GameOver hos den som døde ble startet hos vennen
                 ev_hist = self.__dict__.setdefault("_ev_sync_hist", {})
                 if now - ev_hist.get(f_ev, 0.0) > 25.0 and not getattr(self, "_ev_sync_busy", False):
                     if self.pad.event_busy(self.p) is None:

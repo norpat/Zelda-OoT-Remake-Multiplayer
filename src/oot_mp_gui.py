@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.281"
+VERSION = "0.94.282"
 
 
 def puppet_low_hp_pulse(now):
@@ -2134,6 +2134,10 @@ class PadLink:
                 w = np.full((self.PUPPET_BONE_COUNT, 1), 0.45, dtype=np.float32)
                 for bi in self.PUPPET_PHYSICS_BONES:
                     w[bi, 0] = 0.24
+                # v0.94.282: nakke/hode (102/103) mykere – spillets hode-IK rykker 15–20° på én frame hos avsenderen
+                # (måling 2026-11-21: overføringen er nøyaktig, rykket kommer fra avsenderen selv)
+                for bi in (102, 103):
+                    w[bi, 0] = float(getattr(self, 'head_smooth_w', 0.22))
                 self._skel_ema_w = w
             # Glatt rotasjonsrader (floats 8..19 = +0x20..+0x4C) og translasjon (20..22 = +0x50..+0x58)
             blended = prev[:, 8:23] + w * (cur[:, 8:23] - prev[:, 8:23])

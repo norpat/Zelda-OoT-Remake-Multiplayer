@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.291"
+VERSION = "0.94.292"
 
 
 def puppet_low_hp_pulse(now):
@@ -5698,6 +5698,11 @@ class App:
             p.write(h + 0x1D0, struct.pack('<12f', *m))
             w = struct.unpack('<I', p.read(h + 0x228, 4))[0]
             p.write(h + 0x228, struct.pack('<I', w | 7))
+            # v0.94.292: aktøren kan løsne fra fysikk-kroppen (sett på GAMER2: fe og navneskilt ble stående ~130 m unna
+            # mens kroppen fulgte dukken). Aktørens egen posisjon/rotasjon skrives derfor også – da tegnes den der igjen.
+            p.write(p.base + a + 0x31C, struct.pack('<3f', *pos))
+            if yaw is not None:
+                p.write(p.base + a + 0x328, struct.pack('<9f', m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]))
         except OSError:
             pass
 

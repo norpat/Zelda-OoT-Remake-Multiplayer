@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.288"
+VERSION = "0.94.289"
 
 
 def puppet_low_hp_pulse(now):
@@ -5706,6 +5706,19 @@ class App:
                     st['pool'].append((a0, x0))
             if st['pool']:
                 log(f"fe: gjenbruker {len(st['pool'])} fe(er) som fantes fra før")
+        # v0.94.289: feer som dukket opp senere enn 1 s etter create_actor ble aldri tatt inn (fantes, men ble ikke styrt,
+        # og nye ble laget i stedet). Hvert 3. s: alle Dm_Npc_Navi som ikke er våre tas inn i bassenget (ikke under cutscene).
+        if not st['busy'] and now - st.get('sweep_t', 0) > 3.0 and pad.event_busy(p) is None:
+            st['sweep_t'] = now
+            found = pad._list_actors_raw(p, prefix=self.FAIRY_ACTOR) or {}
+            st['total'] = len(found)
+            mine = {a for a, _ in st['pool']} | {a for a, _ in st['owner'].values()}
+            for a0 in found:
+                if a0 not in mine and a0 not in st['known']:
+                    x0 = pad.actor_x8(p, a0)
+                    if x0 and pad.navi_ready(p, a0, x0):
+                        st['pool'].append((a0, x0)); st['adopted'] = st.get('adopted', 0) + 1
+                        log(f'fe: tok inn usporet fe 0x{a0:X} (forsinket spawn)')
         names = {e[0]: e[1] for e in entries}
         for nm in list(st['owner']):   # spilleren er borte: fe tilbake i bassenget (parkeres)
             if nm not in names:
@@ -5715,7 +5728,8 @@ class App:
                 continue
             if st['pool']:
                 st['owner'][nm] = st['pool'].pop()
-            elif not st['busy'] and st['spawns'] < self.FAIRY_MAX and now - st['spawn_t'] > 4.0:
+            elif (not st['busy'] and st['spawns'] < self.FAIRY_MAX and now - st['spawn_t'] > 4.0
+                  and not (st.get('miss') and now - st['spawn_t'] < 10.0)):   # forrige fant ingen: gi den tid til å dukke opp
                 st['busy'] = True; st['spawn_t'] = now; st['spawns'] += 1
                 try:
                     lp = p.f32(names[nm] + 0x31C, 3)
@@ -5728,6 +5742,7 @@ class App:
                         found = pad._list_actors_raw(p, prefix=self.FAIRY_ACTOR) or {}
                         mine = {a for a, _ in st['pool']} | {a for a, _ in st['owner'].values()}
                         new = [a for a in found if a not in st['known'] and a not in mine]
+                        st['miss'] = not new
                         for a in new[:1]:
                             x8 = pad.actor_x8(p, a)
                             if x8 and pad.navi_ready(p, a, x8):
@@ -5754,7 +5769,7 @@ class App:
             st['log_t'] = now
             try:
                 log('fe: ' + ', '.join(f"{nm} dukke {[round(v, 1) for v in p.f32(names[nm] + 0x31C, 3)]} fe@0x{a:X} {[round(v, 1) for v in p.f32(a + 0x31C, 3)]} x8 {[round(v, 1) for v in (p.f32(_x + 0x1DC), p.f32(_x + 0x1EC), p.f32(_x + 0x1FC))]}"
-                                       for nm, (a, _x) in st['owner'].items() if nm in names) + f" | ledige {len(st['pool'])}")
+                                       for nm, (a, _x) in st['owner'].items() if nm in names) + f" | ledige {len(st['pool'])}, i scenen {st.get('total', '?')}, tatt inn {st.get('adopted', 0)}")
             except OSError:
                 pass
         for a, x8 in st['pool']:   # ledige feer parkeres under bakken (sletting hang tidligere)
@@ -7804,6 +7819,28 @@ class App:
                 if r not in bag.ignored:
                     inv['bag'][f'{r:x}'] = int(c.expected)
         return inv
+
+    def _safe_start_tick(self, now):
+        """v0.94.289: trygg start. Lagringsfilen starter om natten i Hyrule Field med 1 hjerte ved fiender, og spillere døde
+        mens de sto stille. Én gang per nytt spill (ny SaveVar-adresse), 8 s etter at Link er i verden: fyll livet til maks.
+        Ikke ved 0 liv (Game Over) og ikke i PvP. Av med config safe_start: false."""
+        if (not self.cfg.get('safe_start', True) or getattr(self, 'mode', 'Story') != 'Story'
+                or not (self.p and self.ready and getattr(self, 'rupees', None)) or self.rupees.off is None):
+            return
+        off = self.rupees.off
+        if getattr(self, '_ss_off', None) != off:
+            self._ss_off = off; self._ss_t = now + 8.0; self._ss_done = False
+            return
+        if self._ss_done or now < self._ss_t:
+            return
+        self._ss_done = True
+        p = self.p
+        cur, mx = p.u32(off + 0x28), p.u32(off + 0x50)
+        if 0 < cur < mx <= 80:
+            p.write(p.base + off + 0x28, struct.pack('<I', mx))
+            log(f'trygg start: liv {cur}/{mx} -> {mx}/{mx} (kvarte hjerter)')
+        else:
+            log(f'trygg start: liv {cur}/{mx} – ingen endring')
 
     def _story_inv_tick(self, now):
         if (getattr(self, 'mode', 'Story') != 'Story' or not (self.p and self.ready and getattr(self, 'rupees', None))
@@ -12387,6 +12424,10 @@ class App:
             self._boss_tick_async(now)
         self._self_tunic_tick(now)
         self._story_inv_tick(now)
+        try:
+            self._safe_start_tick(now)
+        except Exception as e_ss:  # noqa: BLE001
+            log(f'trygg start: feil {e_ss!r}')
         for nm in ('enemy', 'floor', 'box', 'weapon', 'death', 'pvp', 'bot', 'remote'):
             if nm not in sk or nm == 'remote':
                 getattr(self, f'_{nm}_tick')(now)

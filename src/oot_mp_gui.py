@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.285"
+VERSION = "0.94.286"
 
 
 def puppet_low_hp_pulse(now):
@@ -5906,10 +5906,18 @@ class App:
         import hashlib
         key = hashlib.sha256(f"oot-mp-v1:{self.name.strip().lower()}:{pw}".encode()).hexdigest()
         self.pw_var.set('')
+        old = self._account_key()
+        if old and old != key and getattr(self, '_acct_state', None) in ('ok', 'created'):
+            # innlogget: bytt passord på serveren; det nye lagres først når serveren bekrefter
+            self._acct_pending_key = key
+            self._server_cmd('acct_change', key=old, new_key=key)
+            self._append_chat_sys('🔒 Changing password …')
+            log(f'konto: ber serveren bytte passord for {self.name}')
+            return
         keys = dict(self.cfg.get('account_keys') or {}); keys[self.name] = key
         self.cfg['account_keys'] = keys; save_cfg(self.cfg)
         self._sinv_denied = False
-        self._append_chat_sys(f'🔒 Password saved for {self.name}. Your inventory on the server is now tied to it.')
+        self._append_chat_sys(f'🔒 Password saved for {self.name}. Your inventory and PvP profile on the server are now tied to it.')
         log(f'konto: passord satt for {self.name} (bare avledet nøkkel lagret)')
         if getattr(self, 'mode', 'Story') == 'Story':   # hent på nytt med nøkkelen
             self._sinv_loaded = False; self._inv_load_pending = time.time(); self._server_cmd('inv_get', key=key)
@@ -6782,6 +6790,10 @@ class App:
     def _server_cmd(self, kind, **fields):
         """Send en lobby-/kamp-/posisjonshendelse til oot.premiumaroma.no (eller lokal UDP-testserver)."""
         msg = {'t': kind, 'name': self.name, 'v': VERSION, **fields}
+        if 'key' not in msg:   # v0.94.286: kontonøkkel med alle meldinger (beskytter PvP-profil og inventar)
+            k_ = self._account_key() if hasattr(self, 'cfg') else None
+            if k_:
+                msg['key'] = k_
         if kind in ('hello', 'pose'):
             msg['pose_v2'] = True
         if self.asset_hash:
@@ -6966,6 +6978,20 @@ class App:
             self.pvp_peers = m['peers'] if isinstance(m.get('peers'), list) else []
             self._handle_presence(m)
             self._handle_server_chat(m.get('chat'))
+            if m.get('account') in ('open', 'created', 'ok', 'denied'):
+                if m['account'] != getattr(self, '_acct_state', None):
+                    log(f"konto: serveren sier {m['account']} for {self.name}")
+                    if m['account'] == 'denied' and getattr(self, '_acct_state', None) is not None:
+                        self._append_chat_sys(f'⛔ Wrong password for {self.name} – PvP profile and inventory are locked until you type the right one in 🔒.')
+                self._acct_state = m['account']
+            if m.get('acct_msg') == 'changed' and getattr(self, '_acct_pending_key', None):
+                keys = dict(self.cfg.get('account_keys') or {}); keys[self.name] = self._acct_pending_key
+                self.cfg['account_keys'] = keys; save_cfg(self.cfg); self._acct_pending_key = None
+                self._append_chat_sys('🔒 Password changed.')
+                log(f'konto: passord byttet for {self.name}')
+            elif m.get('acct_msg') == 'change_denied' and getattr(self, '_acct_pending_key', None):
+                self._acct_pending_key = None
+                self._append_chat_sys('⛔ Could not change the password (not logged in with the old one).')
             si_ = m.get('story_inv')
             if isinstance(si_, dict) and si_.get('error') == 'wrong_password':
                 if not getattr(self, '_sinv_denied', False):

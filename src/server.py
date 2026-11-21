@@ -416,6 +416,11 @@ class ZeldaServer:
         if isinstance(bones, str) and len(bones) <= 2048 and bones.isascii():
             player["bones"] = bones
         kind = message.get("t", "hello")
+        # v0.94.286: kontosjekk for alle meldinger med nøkkel (cachet); uten nøkkel beholdes forrige status
+        if "key" in message or "_auth" not in player:
+            k_ = message.get("key")
+            if player.get("_auth_key") != k_ or "_auth" not in player:
+                player["_auth"] = self.check_account(name, k_, now); player["_auth_key"] = k_
         if kind != "pose":
             self.ensure_profile(name, now)
         error = None
@@ -561,13 +566,28 @@ class ZeldaServer:
             if lobby["game_mode"] == "deathmatch" and lobby["started"] and lobby["capacity"] not in (20, 50):
                 self.record_point(name, "eliminated", message, lobby, scoring_team, now)
         elif kind == "buy":
-            error = self.buy_item(name, str(message.get("item_id") or "").strip().lower(), now)
+            if player.get("_auth") == "denied":   # v0.94.286: beskyttet navn – bare eieren kan bruke rubiene
+                error = "Feil passord for dette navnet"
+            else:
+                error = self.buy_item(name, str(message.get("item_id") or "").strip().lower(), now)
         elif kind == "inv_consume":
-            self.consume_inventory(name, message.get("items") or {}, now)
+            if player.get("_auth") != "denied":
+                self.consume_inventory(name, message.get("items") or {}, now)
+        elif kind == "acct_change":   # v0.94.286: bytt passord – krever gyldig nåværende nøkkel
+            new_key = message.get("new_key")
+            if player.get("_auth") in ("ok", "created") and isinstance(new_key, str) and 16 <= len(new_key) <= 128:
+                salt = os.urandom(16)
+                self.db.execute("update accounts set salt=?, hash=? where name=?",
+                                (salt, hashlib.pbkdf2_hmac("sha256", new_key.encode(), salt, 200_000), name))
+                self.db.commit()
+                self.__dict__.setdefault("_auth_ok", {})[name] = hashlib.sha256(new_key.encode()).digest()
+                player["_auth"], player["_auth_key"] = "ok", new_key
+                player["_acct_msg"] = ("changed", now)
+            else:
+                player["_acct_msg"] = ("change_denied", now)
         elif kind == "inv_save":   # v0.94.268: lagre eget Story-inventar (siste versjon vinner)
             inv = message.get("inv")
-            auth = self.check_account(name, message.get("key"), now)
-            player["_auth"] = auth
+            auth = player.get("_auth")
             if auth == "denied":
                 player["_send_inv_until"] = now + 3.0   # svaret bærer feilen
             elif isinstance(inv, dict) and len(json.dumps(inv)) <= 16384:
@@ -576,7 +596,6 @@ class ZeldaServer:
                                 (name, json.dumps(inv, sort_keys=True), now))
                 self.db.commit()
         elif kind == "inv_get":
-            player["_auth"] = self.check_account(name, message.get("key"), now)
             player["_send_inv_until"] = now + 3.0   # svaret går med de neste state-pakkene i 3 s
 
         # Tomme private Story-kanaler ryddes bort etter nøyaktig 10 minutter.
@@ -667,7 +686,8 @@ class ZeldaServer:
                 "lobby": {"id": lobby["id"], "name": lobby["name"], "host": lobby["host"],
                           "capacity": lobby["capacity"], "started": lobby["started"], "started_at": lobby["started_at"],
                           "elapsed": elapsed, "game_mode": lobby["game_mode"]},
-                "lobbies": summaries, "profile": self.get_profile(name), "shop": SHOP_CATALOG,
+                "lobbies": summaries, "profile": None if player.get("_auth") == "denied" else self.get_profile(name), "shop": SHOP_CATALOG,
+                "account": player.get("_auth"), "acct_msg": (player.get("_acct_msg") or (None, 0))[0] if now - (player.get("_acct_msg") or (None, 0))[1] < 3 else None,
                 "online": [{"name": n, "lobby": p["lobby"]} for n, p in self.players.items()
                            if p.get('present') and n != name and p.get("mode", "PvP") == player.get("mode", "PvP")],
                 "present": sorted(n for n, p in self.players.items() if same_channel(p)),
@@ -730,7 +750,21 @@ def make_http_handler(server):
     return TunnelHandler
 
 
+def reset_account(name):
+    """v0.94.286: glemt passord – kjør på serveren: python3 server.py --reset-account <navn>"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "stats.db")
+    if not os.path.isfile(path):
+        raise SystemExit(f"fant ikke databasen {path}")
+    db = sqlite3.connect(path)
+    n = db.execute("delete from accounts where name=?", (name,)).rowcount
+    db.commit()
+    print(f"konto '{name}': {'nullstilt – neste passord som settes tar navnet' if n else 'fantes ikke'}")
+
+
 def main():
+    import sys
+    if len(sys.argv) == 3 and sys.argv[1] == "--reset-account":
+        reset_account(sys.argv[2]); return
     server = ZeldaServer()
     http_srv = http.server.ThreadingHTTPServer(("0.0.0.0", PORT), make_http_handler(server))
     threading.Thread(target=http_srv.serve_forever, daemon=True, name="HTTPServer").start()

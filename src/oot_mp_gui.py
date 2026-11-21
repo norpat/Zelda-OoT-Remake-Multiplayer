@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.293"
+VERSION = "0.94.294"
 
 
 def puppet_low_hp_pulse(now):
@@ -5332,8 +5332,14 @@ class App:
         self.follow_cb = tk.Checkbutton(top_in, text="FOLLOW", variable=self.tvang_var, command=self._tvang_toggled,
                        bg=PANEL, fg=FG, selectcolor=FIELD, activebackground=PANEL, activeforeground=GOLD,
                        font=("Segoe UI", 9))
+        # v0.94.294: navneskilt av/på (bare Story, som navneskiltene selv)
+        self.names_var = tk.BooleanVar(value=bool(self.cfg.get("nameplates", True)))
+        self.names_cb = tk.Checkbutton(top_in, text="NAMES", variable=self.names_var, command=self._names_toggled,
+                       bg=PANEL, fg=FG, selectcolor=FIELD, activebackground=PANEL, activeforeground=GOLD,
+                       font=("Segoe UI", 9))
         if self.cfg.get("mode") != "PvP":   # v0.79: FOLLOW finnes bare i Story
             self.follow_cb.pack(side="left", padx=(10, 0))
+            self.names_cb.pack(side="left", padx=(10, 0))
 
         # --- Spill-status (to kolonner) og Nettverk side om side ---
         row = tk.Frame(root, bg=BG); row.pack(fill="x", padx=14, pady=(4, 4)); self._status_row = row
@@ -5834,7 +5840,7 @@ class App:
     GLYPH_PREFIX = 'CoopGlyph_'
     GLYPH_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
     GLYPH_MAX = 48            # tegn-aktører per sone
-    GLYPH_W = 0.075           # v0.94.293: bare tekst (Kakariko-plakat, materiale «mask», skala 0,15) – tett som vanlig skrift
+    GLYPH_W = 0.055           # v0.94.294: mindre bokstaver (skala 0,11, ~7 cm); v0.94.293: bare tekst (Kakariko-plakat, materiale «mask», skala 0,15) – tett som vanlig skrift
     GLYPH_H = 1.3             # plakatens origo over dukkens føtter (bokstaven ~0,1 m høy)
 
     def _glyph_ok(self, ch):
@@ -5849,7 +5855,8 @@ class App:
     def _coop_nameplates(self, p, now, entries, zone):
         pad = self.pad
         st = self.__dict__.setdefault('_glyph', {'zone': None})
-        if not self.cfg.get('nameplates', True) or getattr(self, 'mode', 'Story') != 'Story':
+        on = bool(self.cfg.get('nameplates', True)) and getattr(self, 'mode', 'Story') == 'Story'
+        if not on:
             entries = ()   # slått av / PvP: alle tegn tilbake i bassenget og parkeres (under)
             if not st.get('owner'):
                 return
@@ -5859,6 +5866,8 @@ class App:
                 or not pad._zone_ready(p, now)):
             return
         names = {e[0]: e[1] for e in entries}
+        if on and self.cfg.get('nameplate_self', True) and pad.p_act is not None and self.name not in names:
+            names[self.name] = pad.p_act   # v0.94.294: eget navn over egen Link også
         if st['known'] is None:
             # tegn som finnes fra før (forrige modd-start i samme spill/sone) gjenbrukes
             if not names or pad.event_busy(p) is not None:
@@ -5966,6 +5975,10 @@ class App:
                                            for nm, o in st['owner'].items())
                 + f" | ledige {sum(len(v) for v in st['free'].values())}, laget {st['spawns']}")
 
+    def _names_toggled(self):
+        self.cfg["nameplates"] = bool(self.names_var.get()); save_cfg(self.cfg)
+        log(f"navneskilt {'på' if self.cfg['nameplates'] else 'av'} (GUI)")
+
     def _tvang_toggled(self):
         self.tvang = bool(self.tvang_var.get()); self.cfg["tvang"] = self.tvang; save_cfg(self.cfg)
         log(f"TVANG {'på' if self.cfg['tvang'] else 'av'}")
@@ -6006,6 +6019,7 @@ class App:
             log(f'modus valgt: {md}')
             if md == 'PvP':   # v0.79: FOLLOW bare i Story
                 self.follow_cb.pack_forget()
+                self.names_cb.pack_forget()
                 self._pvp_lobby_done = False
                 self._pvp_travel_retry = 0
                 self._pvp_in_arena = False; self._pvp_social_lobby = False
@@ -6014,6 +6028,7 @@ class App:
                 self.story_lobby_outer.pack_forget()
                 self.lobby_outer.pack(fill='x', padx=14, pady=4, before=self._status_row)
             else:
+                self.names_cb.pack(side="right")
                 self.follow_cb.pack(side="right")
                 self.lobby_outer.pack_forget()
                 self.story_lobby_outer.pack(fill='x', padx=14, pady=4, before=self._status_row)
@@ -12906,6 +12921,8 @@ class App:
         alive = bool(self.friend and now - self.friend_t < 2) and self._server_says_friend_present(now)
         roster = (getattr(self, '_server_state', None) or {}).get('roster') or []
         follow_locked = follow_locked_by_peer(self.friend if alive else None, roster, self.name)
+        if bool(self.names_var.get()) != bool(self.cfg.get('nameplates', True)):
+            self.names_var.set(bool(self.cfg.get('nameplates', True)))
         if follow_locked != getattr(self, '_follow_remote_locked', None):
             self._follow_remote_locked = follow_locked
             self.follow_cb.config(state=('disabled' if follow_locked else 'normal'),

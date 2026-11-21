@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.282"
+VERSION = "0.94.283"
 
 
 def puppet_low_hp_pulse(now):
@@ -5659,6 +5659,106 @@ class App:
         self.cfg["ghost"] = bool(self.ghost_var.get()); save_cfg(self.cfg)
         log(f"skyggefigur {'på' if self.cfg['ghost'] else 'av'}")
 
+    # v0.94.283: en fe (Navi) ved hver spiller-dukke. Spillets egen Npc_Navi hang spillet (har «følg spilleren»-hjerne).
+    # Dm_Npc_Navi (cutscene-Navi) har bare event-AI: lages med create_actor og flyttes via fysikk-kroppen som Link.
+    # Regler fra tidligere heng: aldri lage under sonelasting/teleport, aldri flytte en død aktør, aldri slette (parker).
+    FAIRY_ACTOR = 'Dm_Npc_Navi'
+    FAIRY_MAX = 8
+
+    def _fairy_move(self, p, a, x8, pos):
+        """Som Link-teleporten: matrise i fysikk-kroppen + flagg |7 (move_actor sin |3 flyttet ikke Dm_Npc_Navi)."""
+        try:
+            h = p.base + x8
+            m = list(struct.unpack('<12f', p.read(h + 0x1D0, 48)))
+            m[3], m[7], m[11] = pos
+            p.write(h + 0x1D0, struct.pack('<12f', *m))
+            w = struct.unpack('<I', p.read(h + 0x228, 4))[0]
+            p.write(h + 0x228, struct.pack('<I', w | 7))
+        except OSError:
+            pass
+
+    def _coop_fairies(self, p, now, entries, zone):
+        if not self.cfg.get('coop_fairies', True) or getattr(self, 'mode', 'Story') != 'Story':
+            return
+        pad = self.pad
+        st = self.__dict__.setdefault('_fairy', {'zone': None})
+        if st.get('zone') != zone:
+            st.clear(); st.update(zone=zone, pool=[], owner={}, parked=set(), spawns=0, spawn_t=0.0, busy=False, known=None)
+        if (not pad.cur_banc or now - getattr(pad, '_banc_since', now) < 12.0 or now < getattr(pad, '_tp_t', 0) + 8.0
+                or not pad._zone_ready(p, now)):
+            return
+        if st['known'] is None:
+            # Feer som finnes fra før (f.eks. fra forrige modd-start i samme spill) gjenbrukes – ellers hoper de seg opp.
+            # Bare når ingen cutscene kjører (da kan en Dm_Npc_Navi være spillets egen).
+            if pad.event_busy(p) is not None:
+                return
+            st['known'] = set()
+            for a0 in (pad._list_actors_raw(p, prefix=self.FAIRY_ACTOR) or {}):
+                x0 = pad.actor_x8(p, a0)
+                if x0 and pad.navi_ready(p, a0, x0):
+                    st['pool'].append((a0, x0))
+            if st['pool']:
+                log(f"fe: gjenbruker {len(st['pool'])} fe(er) som fantes fra før")
+        names = {e[0]: e[1] for e in entries}
+        for nm in list(st['owner']):   # spilleren er borte: fe tilbake i bassenget (parkeres)
+            if nm not in names:
+                st['pool'].append(st['owner'].pop(nm))
+        for nm in names:
+            if nm in st['owner']:
+                continue
+            if st['pool']:
+                st['owner'][nm] = st['pool'].pop()
+            elif not st['busy'] and st['spawns'] < self.FAIRY_MAX and now - st['spawn_t'] > 4.0:
+                st['busy'] = True; st['spawn_t'] = now; st['spawns'] += 1
+                try:
+                    lp = p.f32(names[nm] + 0x31C, 3)
+                except OSError:
+                    st['busy'] = False; continue
+                def _spawn(pos=(lp[0], lp[1] + 1.5, lp[2])):
+                    try:
+                        r = pad.create_actor(p, self.FAIRY_ACTOR, list(pos))
+                        time.sleep(1.0)
+                        found = pad._list_actors_raw(p, prefix=self.FAIRY_ACTOR) or {}
+                        mine = {a for a, _ in st['pool']} | {a for a, _ in st['owner'].values()}
+                        new = [a for a in found if a not in st['known'] and a not in mine]
+                        for a in new[:1]:
+                            x8 = pad.actor_x8(p, a)
+                            if x8 and pad.navi_ready(p, a, x8):
+                                st['pool'].append((a, x8))
+                        log(f'fe: laget {self.FAIRY_ACTOR} -> {r}, {len(new)} ny(e), basseng {len(st["pool"])}')
+                    except Exception as e:  # noqa: BLE001
+                        log(f'fe: spawn-feil {e!r}')
+                    finally:
+                        st['busy'] = False
+                threading.Thread(target=_spawn, daemon=True, name='FairySpawn').start()
+        for nm, (a, x8) in list(st['owner'].items()):
+            if not pad.navi_ready(p, a, x8):   # død aktør flyttes aldri
+                st['owner'].pop(nm, None); continue
+            try:
+                lp = p.f32(names[nm] + 0x31C, 3)
+            except OSError:
+                continue
+            ph = (hash(nm) % 628) / 100.0
+            ang = now * 1.3 + ph
+            pos = (lp[0] + 0.55 * math.cos(ang), lp[1] + 1.35 + 0.12 * math.sin(now * 3.1 + ph), lp[2] + 0.55 * math.sin(ang))
+            self._fairy_move(p, a, x8, pos)
+            st['parked'].discard(a)
+        if now - st.get('log_t', 0) > 10:
+            st['log_t'] = now
+            try:
+                log('fe: ' + ', '.join(f"{nm} dukke {[round(v, 1) for v in p.f32(names[nm] + 0x31C, 3)]} fe@0x{a:X} {[round(v, 1) for v in p.f32(a + 0x31C, 3)]} x8 {[round(v, 1) for v in (p.f32(_x + 0x1DC), p.f32(_x + 0x1EC), p.f32(_x + 0x1FC))]}"
+                                       for nm, (a, _x) in st['owner'].items() if nm in names) + f" | ledige {len(st['pool'])}")
+            except OSError:
+                pass
+        for a, x8 in st['pool']:   # ledige feer parkeres under bakken (sletting hang tidligere)
+            if a not in st['parked'] and pad.navi_ready(p, a, x8):
+                try:
+                    lp = p.f32(a + 0x31C, 3)
+                    self._fairy_move(p, a, x8, (lp[0], lp[1] - 200.0, lp[2]))
+                    st['parked'].add(a)
+                except OSError:
+                    pass
+
     def _tvang_toggled(self):
         self.tvang = bool(self.tvang_var.get()); self.cfg["tvang"] = self.tvang; save_cfg(self.cfg)
         log(f"TVANG {'på' if self.cfg['tvang'] else 'av'}")
@@ -8015,7 +8115,7 @@ class App:
                     self.chat_var.set(t); self._send_chat()
                 self.ui(run)
 
-    INFO_CMDS = ('/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
+    INFO_CMDS = ('/spawn', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
 
     def _info_cmd(self, line):
         """Info-kommandoer (svar i chat og logg). Brukes også fra chatten."""
@@ -8030,6 +8130,23 @@ class App:
             elif cmd == '/skip':
                 SKIP.clear(); SKIP.update(x for x in (line.split()[1] if len(line.split()) > 1 else '').split(',') if x)
                 out.append(f'hopper over: {sorted(SKIP)}'); log(f'skip: {sorted(SKIP)}')
+            elif cmd == '/spawn':   # v0.94.283 test: /spawn <aktørnavn> [høyde] – lager aktøren 1,5 m foran egen Link
+                parts = line.split()
+                if len(parts) < 2 or not (self.p and self.pad.p_act is not None):
+                    out.append('bruk: /spawn <navn> [høyde]')
+                else:
+                    nm_, dy_ = parts[1], (float(parts[2]) if len(parts) > 2 else 1.2)
+                    lp_ = self.p.f32(self.pad.p_act + 0x31C, 3)
+                    pos_ = [lp_[0] + 1.0, lp_[1] + dy_, lp_[2] + 1.0]
+                    def _sp(nm_=nm_, pos_=pos_):
+                        r_ = self.pad.create_actor(self.p, nm_, pos_)
+                        log(f'spawn-test: {nm_} ved {[round(v, 1) for v in pos_]} -> {r_}')
+                        for t_ in (1.0, 3.0, 8.0):
+                            time.sleep(t_)
+                            f_ = self.pad._list_actors_raw(self.p, prefix=nm_) or {}
+                            log(f'spawn-test: etter {t_:.0f}s finnes {len(f_)} {nm_}: {[(hex(k), [round(x, 1) for x in v[1]]) for k, v in f_.items()][:3]}')
+                    threading.Thread(target=_sp, daemon=True).start()
+                    out.append(f'spawn-test: lager {nm_}')
             elif cmd == '/blinkmode':   # /blinkmode 40 | all
                 self.pad.blink_mode = (line.split()[1] if len(line.split()) > 1 else 'all')
                 self.pad.__dict__.get('_pup_blink_addrs', {}).clear()
@@ -11498,6 +11615,11 @@ class App:
                 pad.publish_puppet_pose_owners(p, tuple(owners[:pad.PUPPET_MAX]))
                 if active_entries:
                     self._animate_puppets(p, now, active_entries, {})
+                    try:
+                        self._coop_fairies(p, now, active_entries, zone)
+                    except Exception as e_f:  # noqa: BLE001
+                        if now - getattr(self, '_fairy_err_t', 0) > 10:
+                            self._fairy_err_t = now; log(f'fe: feil {e_f!r}')
                     # v0.94.244: 3D rød lav-HP-blinking på alle 24 MaterialObj-buffere (+ dirty-flagg 0x0101) på CoopPuppet når spilleren har <= 1 hjerte
                     prev_low_map = self.__dict__.setdefault('_pup_low_hp_prev_map', {})
                     for _it in active_entries:

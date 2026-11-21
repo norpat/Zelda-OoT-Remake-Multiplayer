@@ -7822,14 +7822,14 @@ class App:
 
     def _safe_start_tick(self, now):
         """v0.94.289: trygg start. Lagringsfilen starter om natten i Hyrule Field med 1 hjerte ved fiender, og spillere døde
-        mens de sto stille. Én gang per nytt spill (ny SaveVar-adresse), 8 s etter at Link er i verden: fyll livet til maks.
+        mens de sto stille. Én gang per nytt spill (ny SaveVar-adresse), 1 s etter at Link er i verden: fyll livet til maks.
         Ikke ved 0 liv (Game Over) og ikke i PvP. Av med config safe_start: false."""
         if (not self.cfg.get('safe_start', True) or getattr(self, 'mode', 'Story') != 'Story'
                 or not (self.p and self.ready and getattr(self, 'rupees', None)) or self.rupees.off is None):
             return
         off = self.rupees.off
         if getattr(self, '_ss_off', None) != off:
-            self._ss_off = off; self._ss_t = now + 8.0; self._ss_done = False
+            self._ss_off = off; self._ss_t = now + 1.0; self._ss_done = False
             return
         if self._ss_done or now < self._ss_t:
             return
@@ -8249,6 +8249,9 @@ class App:
                             r_ = pad_.change_banc(self.p, banc_, start_)
                             if r_:
                                 break
+                        if _try % 5 == 0:   # v0.94.289: hvorfor venter vi?
+                            log(f'zone: venter (forsøk {_try}): anim={an_} hendelse={pad_.event_busy(self.p)} '
+                                f'teleport for {time.time() - getattr(pad_, "_tp_t", 0):.0f} s siden, change_banc={r_}')
                         time.sleep(2.0)
                     log(f'zone: {banc_} @ {start_} -> {r_}')
                     out.append(f'zone: {banc_} @ {start_} -> {r_}')

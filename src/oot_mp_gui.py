@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.289"
+VERSION = "0.94.290"
 
 
 def puppet_low_hp_pulse(now):
@@ -5670,19 +5670,48 @@ class App:
     # Dm_Npc_Navi (cutscene-Navi) har bare event-AI: lages med create_actor og flyttes via fysikk-kroppen som Link.
     # Regler fra tidligere heng: aldri lage under sonelasting/teleport, aldri flytte en død aktør, aldri slette (parker).
     FAIRY_ACTOR = 'Dm_Npc_Navi'
+    # v0.94.290: CoopFairy (tools/fairy_pack.py) = Dm_Npc_Navi med Naviens Wait-animasjon, så vingene blafrer.
+    # Brukes når pakken finnes i romfs og spillet faktisk kan lage den (krever omstart etter pakking); ellers Dm_Npc_Navi.
+    FAIRY_COOP = 'CoopFairy'
+
+    @property
+    def fairy_actor(self):
+        ok = getattr(self, '_fairy_coop_ok', None)
+        if ok is None:
+            ok = self._fairy_coop_ok = os.path.isfile(os.path.join(TUNIC_DIR, 'romfs', 'Pack', 'Actor', self.FAIRY_COOP + '.pack.zs'))
+            log(f"fe: bruker {self.FAIRY_COOP if ok else self.FAIRY_ACTOR} ({'pakke funnet' if ok else 'ingen CoopFairy-pakke'})")
+        return self.FAIRY_COOP if ok else self.FAIRY_ACTOR
     FAIRY_MAX = 8
 
-    def _fairy_move(self, p, a, x8, pos):
-        """Som Link-teleporten: matrise i fysikk-kroppen + flagg |7 (move_actor sin |3 flyttet ikke Dm_Npc_Navi)."""
+    def _fairy_move(self, p, a, x8, pos, yaw=None):
+        """Som Link-teleporten: matrise i fysikk-kroppen + flagg |7 (move_actor sin |3 flyttet ikke Dm_Npc_Navi).
+        v0.94.290: yaw (radianer) snur feen i fartsretningen (ellers fløy den sidelengs rundt dukken)."""
         try:
             h = p.base + x8
             m = list(struct.unpack('<12f', p.read(h + 0x1D0, 48)))
             m[3], m[7], m[11] = pos
+            if yaw is not None:
+                c_, s_ = math.cos(yaw), math.sin(yaw)
+                m[0], m[1], m[2] = c_, 0.0, s_
+                m[4], m[5], m[6] = 0.0, 1.0, 0.0
+                m[8], m[9], m[10] = -s_, 0.0, c_
             p.write(h + 0x1D0, struct.pack('<12f', *m))
             w = struct.unpack('<I', p.read(h + 0x228, 4))[0]
             p.write(h + 0x228, struct.pack('<I', w | 7))
         except OSError:
             pass
+
+    def _fairy_lost(self, p, a):
+        """v0.94.290: fe parkert 200 m ned (eldre versjoner) – CoopFairy-aktøren blir liggende der selv om fysikk-kroppen
+        flyttes, og ville tegnes under bakken. Slike tas ikke inn igjen."""
+        try:
+            fy = p.f32(a + 0x320); my = p.f32(self.pad.p_act + 0x320)
+        except (OSError, TypeError):
+            return False
+        if fy < my - 50.0:
+            log(f'fe: 0x{a:X} ligger {my - fy:.0f} m under spilleren (gammel parkering) – brukes ikke')
+            return True
+        return False
 
     def _coop_fairies(self, p, now, entries, zone):
         if not self.cfg.get('coop_fairies', True) or getattr(self, 'mode', 'Story') != 'Story':
@@ -5700,9 +5729,9 @@ class App:
             if pad.event_busy(p) is not None:
                 return
             st['known'] = set()
-            for a0 in (pad._list_actors_raw(p, prefix=self.FAIRY_ACTOR) or {}):
+            for a0 in (pad._list_actors_raw(p, prefix=self.fairy_actor) or {}):
                 x0 = pad.actor_x8(p, a0)
-                if x0 and pad.navi_ready(p, a0, x0):
+                if x0 and pad.navi_ready(p, a0, x0) and not self._fairy_lost(p, a0):
                     st['pool'].append((a0, x0))
             if st['pool']:
                 log(f"fe: gjenbruker {len(st['pool'])} fe(er) som fantes fra før")
@@ -5710,12 +5739,14 @@ class App:
         # og nye ble laget i stedet). Hvert 3. s: alle Dm_Npc_Navi som ikke er våre tas inn i bassenget (ikke under cutscene).
         if not st['busy'] and now - st.get('sweep_t', 0) > 3.0 and pad.event_busy(p) is None:
             st['sweep_t'] = now
-            found = pad._list_actors_raw(p, prefix=self.FAIRY_ACTOR) or {}
+            found = pad._list_actors_raw(p, prefix=self.fairy_actor) or {}
             st['total'] = len(found)
             mine = {a for a, _ in st['pool']} | {a for a, _ in st['owner'].values()}
             for a0 in found:
                 if a0 not in mine and a0 not in st['known']:
                     x0 = pad.actor_x8(p, a0)
+                    if self._fairy_lost(p, a0):
+                        st['known'].add(a0); continue
                     if x0 and pad.navi_ready(p, a0, x0):
                         st['pool'].append((a0, x0)); st['adopted'] = st.get('adopted', 0) + 1
                         log(f'fe: tok inn usporet fe 0x{a0:X} (forsinket spawn)')
@@ -5728,7 +5759,8 @@ class App:
                 continue
             if st['pool']:
                 st['owner'][nm] = st['pool'].pop()
-            elif (not st['busy'] and st['spawns'] < self.FAIRY_MAX and now - st['spawn_t'] > 4.0
+                continue
+            if (not st['busy'] and st['spawns'] < self.FAIRY_MAX and now - st['spawn_t'] > 4.0
                   and not (st.get('miss') and now - st['spawn_t'] < 10.0)):   # forrige fant ingen: gi den tid til å dukke opp
                 st['busy'] = True; st['spawn_t'] = now; st['spawns'] += 1
                 try:
@@ -5737,9 +5769,14 @@ class App:
                     st['busy'] = False; continue
                 def _spawn(pos=(lp[0], lp[1] + 1.5, lp[2])):
                     try:
-                        r = pad.create_actor(p, self.FAIRY_ACTOR, list(pos))
+                        fa_ = self.fairy_actor
+                        r = pad.create_actor(p, fa_, list(pos))
+                        if not r and fa_ == self.FAIRY_COOP:   # spillet kjenner ikke CoopFairy ennå (ikke startet på nytt)
+                            self._fairy_coop_ok = False; st['spawns'] -= 1
+                            log('fe: CoopFairy kunne ikke lages – bruker Dm_Npc_Navi til spillet startes på nytt')
+                            return
                         time.sleep(1.0)
-                        found = pad._list_actors_raw(p, prefix=self.FAIRY_ACTOR) or {}
+                        found = pad._list_actors_raw(p, prefix=self.fairy_actor) or {}
                         mine = {a for a, _ in st['pool']} | {a for a, _ in st['owner'].values()}
                         new = [a for a in found if a not in st['known'] and a not in mine]
                         st['miss'] = not new
@@ -5747,7 +5784,9 @@ class App:
                             x8 = pad.actor_x8(p, a)
                             if x8 and pad.navi_ready(p, a, x8):
                                 st['pool'].append((a, x8))
-                        log(f'fe: laget {self.FAIRY_ACTOR} -> {r}, {len(new)} ny(e), basseng {len(st["pool"])}')
+                                if fa_ == self.FAIRY_COOP:   # v0.94.290: Naviens vente-animasjon (vingene blafrer)
+                                    log(f"fe: Wait-animasjon -> {pad.play_anim(p, a, self.cfg.get('fairy_anim', 'Wait'))}, nå {pad.read_anim(p, a)}")
+                        log(f'fe: laget {self.fairy_actor} -> {r}, {len(new)} ny(e), basseng {len(st["pool"])}')
                     except Exception as e:  # noqa: BLE001
                         log(f'fe: spawn-feil {e!r}')
                     finally:
@@ -5763,7 +5802,7 @@ class App:
             ph = (hash(nm) % 628) / 100.0
             ang = now * 1.3 + ph
             pos = (lp[0] + 0.55 * math.cos(ang), lp[1] + 1.35 + 0.12 * math.sin(now * 3.1 + ph), lp[2] + 0.55 * math.sin(ang))
-            self._fairy_move(p, a, x8, pos)
+            self._fairy_move(p, a, x8, pos, -ang + math.radians(float(self.cfg.get('fairy_yaw_off', 0))))
             st['parked'].discard(a)
         if now - st.get('log_t', 0) > 10:
             st['log_t'] = now
@@ -5772,11 +5811,11 @@ class App:
                                        for nm, (a, _x) in st['owner'].items() if nm in names) + f" | ledige {len(st['pool'])}, i scenen {st.get('total', '?')}, tatt inn {st.get('adopted', 0)}")
             except OSError:
                 pass
-        for a, x8 in st['pool']:   # ledige feer parkeres under bakken (sletting hang tidligere)
+        for a, x8 in st['pool']:   # ledige feer parkeres 3 m under bakken (sletting hang tidligere)
             if a not in st['parked'] and pad.navi_ready(p, a, x8):
                 try:
                     lp = p.f32(a + 0x31C, 3)
-                    self._fairy_move(p, a, x8, (lp[0], lp[1] - 200.0, lp[2]))
+                    self._fairy_move(p, a, x8, (lp[0], lp[1] - 3.0, lp[2]))   # v0.94.290: 200 m ned løsnet CoopFairy fra fysikk-kroppen
                     st['parked'].add(a)
                 except OSError:
                     pass
@@ -11569,8 +11608,19 @@ class App:
                     self._server_clock_active = False
                 mine = self.pad.read_time(self.p); self._my_wtime = mine
                 mw = self.pad.read_weather(self.p); self._my_wweather = mw
-                if (srv_ww is not None or not host) and fww is not None and mw is not None and fww != mw and time.time() - getattr(self, '_ww_set_t', 0) > 15:
-                    self._ww_set_t = time.time()
+                # v0.94.290: innendørs (f.eks. Deku-treet) setter spillet været tilbake rett etter at vi skrev det. Å skrive
+                # på nytt hvert 15. s ga en evig 5 s lysovergang (Link/dukker «flimret»). Etter 2 tilbakestillinger i
+                # samme sone lar vi været være til neste sonebytte.
+                zone_ = getattr(self.pad, 'cur_banc', None)
+                wr_ = self.__dict__.setdefault('_ww_revert', {'zone': None, 'n': 0, 'last': None})
+                if wr_['zone'] != zone_:
+                    wr_.update(zone=zone_, n=0, last=None)
+                if wr_['last'] is not None and mw != wr_['last'] and fww != mw:
+                    wr_['n'] += 1; wr_['last'] = None
+                    if wr_['n'] == 2:
+                        log(f'vær: spillet setter {PadLink.WEATHERS[mw]} i {zone_} (innendørs?) – slutter å skrive vær her')
+                if (srv_ww is not None or not host) and fww is not None and mw is not None and fww != mw and wr_['n'] < 2 and time.time() - getattr(self, '_ww_set_t', 0) > 15:
+                    self._ww_set_t = time.time(); wr_['last'] = fww
                     first = not getattr(self, '_ww_synced', False); self._ww_synced = True
                     if self.pad.write_weather(self.p, fww, 0 if first else 5):
                         log(f'vær: satt til {"serverens" if srv_ww is not None else "vertens"} {PadLink.WEATHERS[fww]} (var {PadLink.WEATHERS[mw]})')

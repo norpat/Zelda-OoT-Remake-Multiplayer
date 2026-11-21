@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.292"
+VERSION = "0.94.293"
 
 
 def puppet_low_hp_pulse(now):
@@ -5827,15 +5827,15 @@ class App:
                     pass
 
     # ------------------------------------------------------------------ v0.94.291: navneskilt i spillet
-    # Én aktør per tegn: CoopGlyph_<A-Z/0-9> (tools/glyph_pack.py) = Kokiri-treskiltet skalert til 1/4 via rotbeinet i
-    # modellen, med egen tekstur (hvit bokstav på mørk flate). Et navn = en rad slike skilt over hodet til dukken,
+    # Én aktør per tegn: CoopGlyph_<A-Z/0-9> (tools/glyph_pack.py) = Kokiri-treskilt-aktøren med Kakariko-plakatens
+    # modell (v0.94.293; gjennomsiktig «mask»-materiale, skalert via rotbeinet) og egen tekstur (hvit bokstav, svart kant). Et navn = en rad slike skilt over hodet til dukken,
     # snudd mot kameraet og flyttet via fysikk-kroppen som feene. Samme regler som feene: aldri lage under sonelasting,
     # aldri flytte en død aktør, aldri slette (ledige parkeres under bakken). Krever omstart av spillet etter pakking.
     GLYPH_PREFIX = 'CoopGlyph_'
     GLYPH_CHARS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789'
     GLYPH_MAX = 48            # tegn-aktører per sone
-    GLYPH_W = 0.24            # avstand mellom tegnene (skiltbredde 1,0 m x beinskala 0,25)
-    GLYPH_H = 1.25            # skiltfoten over dukkens føtter (skiltflaten ~0,2–0,34 m over foten)
+    GLYPH_W = 0.075           # v0.94.293: bare tekst (Kakariko-plakat, materiale «mask», skala 0,15) – tett som vanlig skrift
+    GLYPH_H = 1.3             # plakatens origo over dukkens føtter (bokstaven ~0,1 m høy)
 
     def _glyph_ok(self, ch):
         have = self.__dict__.setdefault('_glyph_have', {})
@@ -5948,7 +5948,7 @@ class App:
                 ch, a, x8 = sl
                 if not pad.navi_ready(p, a, x8):   # død aktør flyttes aldri
                     o['slots'][i] = None; continue
-                k = (i - (n_ - 1) / 2) * self.GLYPH_W
+                k = (i - (n_ - 1) / 2) * float(self.cfg.get('glyph_spacing', self.GLYPH_W))
                 self._fairy_move(p, a, x8, (base[0] + rx * k, base[1], base[2] + rz * k), yaw)
                 st['parked'].discard(a)
         for ch, lst in st['free'].items():   # ledige tegn parkeres 6 m under bakken

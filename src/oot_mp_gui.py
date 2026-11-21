@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.280"
+VERSION = "0.94.281"
 
 
 def puppet_low_hp_pulse(now):
@@ -4010,6 +4010,7 @@ class PadLink:
     SYNC_EVENT_SKIP_PREFIXES = (
         "Dm_SY_", "Demo_SY_", "Door", "Treasure", "ItemGet", "Warp",
         "Fade", "Save", "Title", "GameOver", "Sys_", "System_",
+        "BancChange",   # v0.94.281: sone-bytte (f.eks. BancChangeGo_Market) – startet hos vennen ga evig lasteskjerm; FOLLOW/party_warp tar sonebytter
     )
 
     def read_active_event(self, p):
@@ -12185,7 +12186,7 @@ class App:
                 and isinstance(self.friend, dict) and now - getattr(self, 'friend_t', 0) < 3.0
                 and self.pad.cur_banc and self.pad.cur_banc == self.pad.friend_banc):
             f_ev = self.friend.get("ev")
-            if isinstance(f_ev, str) and len(f_ev) >= 4 and not f_ev.startswith(self.pad.SYNC_EVENT_SKIP_PREFIXES):
+            if isinstance(f_ev, str) and len(f_ev) >= 4 and not f_ev.startswith(self.pad.SYNC_EVENT_SKIP_PREFIXES) and 'BancChange' not in f_ev:
                 ev_hist = self.__dict__.setdefault("_ev_sync_hist", {})
                 if now - ev_hist.get(f_ev, 0.0) > 25.0 and not getattr(self, "_ev_sync_busy", False):
                     if self.pad.event_busy(self.p) is None:

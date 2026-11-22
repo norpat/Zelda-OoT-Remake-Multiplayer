@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.301"
+VERSION = "0.94.302"
 
 
 def puppet_low_hp_pulse(now):
@@ -6833,6 +6833,7 @@ class App:
         fails = cam_fails = far = 0
         last_joint = 0.0
         frozen_since, last_xyz = None, None
+        ap_last, ap_moved_t = None, time.time()   # v0.94.302: Link-aktørens posisjon (uavhengig av fysikk-posten)
         while p.alive() and fails < 6:
             # --- Gammel Link-post etter områdebytte? (den gamle blir liggende med gamle tall og passerer valideringen)
             try:
@@ -6847,7 +6848,16 @@ class App:
                 else:
                     frozen_since = None
                 last_xyz = xyz
-            if frozen_since and time.time() - frozen_since >= 5 and time.time() - last_joint >= 30:
+            # v0.94.302: står også Link-aktøren stille, står spilleren bare i ro – da er en stille post ventet, og vi
+            # søker ikke (før: 512 MB lest hvert 30. s og hele minnet hvert 3. min når man sto i ro, ~1 CPU-kjerne)
+            try:
+                ap_ = self.pad.my_apos(p)
+            except Exception:  # noqa: BLE001
+                ap_ = None
+            if ap_ is not None and (ap_last is None or math.dist(ap_, ap_last) > 0.05):
+                ap_last, ap_moved_t = ap_, time.time()
+            idle_ = ap_ is not None and time.time() - ap_moved_t > 10
+            if frozen_since and not idle_ and time.time() - frozen_since >= 5 and time.time() - last_joint >= 30:
                 last_joint = time.time()
                 anchors = [self.cam_off, getattr(self, "last_cam", None), self.cfg.get("cam_off"), *self.cfg.get("cam_history", [])]
                 full = time.time() - getattr(self, "_last_full_joint", 0) >= 180 and getattr(self, "_joint_misses", 0) >= 2

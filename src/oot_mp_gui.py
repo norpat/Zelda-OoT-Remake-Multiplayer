@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.297"
+VERSION = "0.94.298"
 
 
 def puppet_low_hp_pulse(now):
@@ -5737,7 +5737,7 @@ class App:
         return False
 
     def _coop_fairies(self, p, now, entries, zone):
-        if not self.cfg.get('coop_fairies', True) or getattr(self, 'mode', 'Story') != 'Story':
+        if not self.cfg.get('coop_fairies', True) or getattr(self, 'mode', 'Story') not in ('Story', 'PvP'):   # v0.94.298: også PvP
             return
         pad = self.pad
         st = self.__dict__.setdefault('_fairy', {'zone': None})
@@ -5787,9 +5787,8 @@ class App:
                   and st['spawns'] < self.FAIRY_MAX and now - st['spawn_t'] > 4.0
                   and not (st.get('miss') and now - st['spawn_t'] < 10.0)):   # forrige fant ingen: gi den tid til å dukke opp
                 st['busy'] = True; st['spawn_t'] = now; st['spawns'] += 1
-                try:
-                    lp = p.f32(names[nm] + 0x31C, 3)
-                except OSError:
+                lp = self._plate_pos(p, names[nm], st)   # v0.94.298: fysikk-kroppens posisjon (+0x31C kunne stå igjen etter teleport)
+                if lp is None:
                     st['busy'] = False; continue
                 def _spawn(pos=(lp[0], lp[1] + 1.5, lp[2])):
                     try:
@@ -5819,9 +5818,8 @@ class App:
         for nm, (a, x8) in list(st['owner'].items()):
             if not pad.navi_ready(p, a, x8):   # død aktør flyttes aldri
                 st['owner'].pop(nm, None); continue
-            try:
-                lp = p.f32(names[nm] + 0x31C, 3)
-            except OSError:
+            lp = self._plate_pos(p, names[nm], st)   # v0.94.298: der dukken faktisk tegnes
+            if lp is None:
                 continue
             ph = (hash(nm) % 628) / 100.0
             ang = now * 1.3 + ph
@@ -5831,7 +5829,7 @@ class App:
         if now - st.get('log_t', 0) > 10:
             st['log_t'] = now
             try:
-                log('fe: ' + ', '.join(f"{nm} dukke {[round(v, 1) for v in p.f32(names[nm] + 0x31C, 3)]} fe@0x{a:X} {[round(v, 1) for v in p.f32(a + 0x31C, 3)]} x8 {[round(v, 1) for v in (p.f32(_x + 0x1DC), p.f32(_x + 0x1EC), p.f32(_x + 0x1FC))]}"
+                log('fe: ' + ', '.join(f"{nm} dukke {[round(v, 1) for v in (self._plate_pos(p, names[nm], st) or (0, 0, 0))]} fe@0x{a:X} {[round(v, 1) for v in p.f32(a + 0x31C, 3)]} x8 {[round(v, 1) for v in (p.f32(_x + 0x1DC), p.f32(_x + 0x1EC), p.f32(_x + 0x1FC))]}"
                                        for nm, (a, _x) in st['owner'].items() if nm in names) + f" | ledige {len(st['pool'])}, i scenen {st.get('total', '?')}, tatt inn {st.get('adopted', 0)}")
             except OSError:
                 pass

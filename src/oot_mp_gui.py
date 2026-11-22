@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.300"
+VERSION = "0.94.301"
 
 
 def puppet_low_hp_pulse(now):
@@ -6474,6 +6474,25 @@ class App:
                 self._append_chat_sys(f"Only the host{f' ({host})' if host else ''} can use commands.")
             log(f'kommando avvist (ikke Story-host): {txt[:40]}')
             return
+        if low.startswith('/') and not getattr(self, '_remote_run', False) and low.split()[0] not in self.HOST_CMDS:
+            self.chat_var.set("")   # v0.94.301: juks-/test-kommandoer (/goto, /spawn, /skip …) bare via remote_cmd.txt
+            self._append_chat_sys('Unknown command – click Commands to see the list.')
+            log(f'kommando avvist (juks/test, bare fjernstyring): {txt[:40]}')
+            return
+        if low == '/help' and not getattr(self, '_remote_run', False):
+            self.chat_var.set(""); self._show_commands()   # v0.94.301: hosten ser bare sin egen liste
+            return
+        if low.startswith('/rupees'):   # v0.94.301: bare fjernstyring (test) – f.eks. sette tilbake rupees etter test-spawn
+            self.chat_var.set("")
+            try:
+                n = max(0, min(999, int(low.split()[1])))
+                old = self.rupees.tick()
+                self.rupees.mute(3.0); self.rupees._set(n)
+                log(f'rupees: satt {old} -> {n} (fjern-kommando)')
+                self._append_chat_sys(f'rupees: {old} -> {n}')
+            except Exception as e:  # noqa: BLE001
+                log(f'rupees: feilet: {e!r}')
+            return
         if low.startswith('/mode'):
             self.chat_var.set("")
             requested = next((m for m in MODES if low == f'/mode {m.lower()}'), None)
@@ -8989,6 +9008,12 @@ class App:
         except Exception:  # noqa: BLE001
             pass
         self.root.after(1500, self._cmd_btn_tick)
+
+    # v0.94.301: det Story-hosten kan skrive selv; alt annet (/goto, /spawn, /skip, /paint …) er juks/test og
+    # virker bare via remote_cmd.txt ved exe-en
+    HOST_CMDS = ('/tp', '/warp', '/here', '/samle', '/teleport', '/resetboss', '/opendoor', '/door', '/near',
+                 '/target', '/aihold', '/status', '/enemies', '/boss', '/flags', '/items', '/mode', '/help',
+                 '/inv', '/ping')
 
     def _show_commands(self):
         for line in ("Commands (type in the chat, Enter sends):",

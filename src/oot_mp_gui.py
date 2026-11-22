@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.296"
+VERSION = "0.94.297"
 
 
 def puppet_low_hp_pulse(now):
@@ -3482,7 +3482,8 @@ class PadLink:
             try:
                 lp_ = p.f32(c_act + 0x31C, 3)
                 dgw = {}; self._scan_full_t = 0; self._scan_actors_raw(p, dgw); self._diag_all = None
-                worn = any(nm == name and math.dist(p.f32(ha + 0x31C, 3), lp_) < 0.3 for ha, nm in dgw.items())
+                worn_arm = next((ha for ha, nm in dgw.items() if nm == name and math.dist(p.f32(ha + 0x31C, 3), lp_) < 0.3), None)
+                worn = worn_arm is not None
                 other = any(nm.startswith('Armor_Child_Tunic_') and nm != name and math.dist(p.f32(ha + 0x31C, 3), lp_) < 0.3 for ha, nm in dgw.items())
                 # v0.94.279/280: oppstartsfargen ligger i romfs – uten annet mod-plagg på er Link allerede riktig farge
                 if who == 'me' and look == getattr(self, 'romfs_look', None) and not other:
@@ -3490,6 +3491,17 @@ class PadLink:
             except OSError:
                 worn = False
             if worn:
+                if worn_arm is not None:
+                    # v0.94.297: plagget sitter allerede på (modd-omstart i samme spill) – sørg for at bare plagget vises.
+                    # Før kunne grunn-tunikaen (romfs-fargen) bli synlig igjen under plagget: to tunikaer oppå hverandre
+                    # som flimret mellom fargene (hvit Link som blinket cyan).
+                    try:
+                        for m in self.TUNIC_SHOW:
+                            self.set_material_visible(p, worn_arm, m, True)
+                            self.set_material_visible(p, c_act, m, False)
+                        self.__dict__.setdefault('_tun_worn', {})[who] = (worn_arm, c_act)
+                    except OSError:
+                        pass
                 self.__dict__[{'l2': '_tun_done', 'me': '_tun_done_me'}.get(who, '_tun_done_bot')] = (copy, look)
                 log(f"tunika: {'Link 2' if who == 'l2' else 'min Link'} har allerede {name} på – tar ikke på igjen")
                 return
@@ -6228,8 +6240,20 @@ class App:
 
         def _undo():
             try:
-                own = _show(p_act, self.pad.TUNIC_SHOW)
                 pos = self.pad.my_apos(p)
+                # v0.94.297: har egen Link et farge-plagg på (Armor_Child_Tunic_*), skal grunn-tunikaen være skjult –
+                # å vise den igjen ga to tunikaer oppå hverandre (flimring mellom to farger).
+                arm_on = False
+                try:
+                    if pos is not None:
+                        dga = {}; self.pad._scan_full_t = 0; self.pad._scan_actors_raw(p, dga); self.pad._diag_all = None
+                        arm_on = any(nm.startswith('Armor_Child_Tunic_') and math.dist(p.f32(ha + 0x31C, 3), pos) < 0.3
+                                     for ha, nm in dga.items())
+                except OSError:
+                    arm_on = False
+                own = 0 if arm_on else _show(p_act, self.pad.TUNIC_SHOW)
+                if arm_on:
+                    log('tunika: egen Link har farge-plagg på – grunn-tunikaen forblir skjult')
                 found = self.pad._list_actors_raw(p, prefix='CoopPuppet_') or {}
                 near = []
                 for act in found:

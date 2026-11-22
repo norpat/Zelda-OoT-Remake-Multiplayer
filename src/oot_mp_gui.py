@@ -5972,6 +5972,7 @@ class App:
             except OSError:
                 continue
             base = (lp[0], lp[1] + float(self.cfg.get('glyph_height', self.GLYPH_H)), lp[2])
+            o['at'] = (round(lp[0], 1), round(lp[1], 1), round(lp[2], 1))
             yaw = math.atan2(eye[0] - base[0], eye[2] - base[2]) if eye else 0.0
             yaw += yoff
             rx, rz = math.cos(yaw), -math.sin(yaw)   # skiltets +X (leseretning) i verden
@@ -5996,7 +5997,7 @@ class App:
                         pass
         if now - st.get('log_t', 0) > 15 and st['owner']:
             st['log_t'] = now
-            log('navneskilt: ' + ', '.join(f"{nm} '{o['text']}'{('/' + o['col']) if o.get('col') else ''} {sum(1 for s in o['slots'] if s)}/{len(o['slots'])}"
+            log('navneskilt: ' + ', '.join(f"{nm} '{o['text']}'{('/' + o['col']) if o.get('col') else ''} {sum(1 for s in o['slots'] if s)}/{len(o['slots'])} @{o.get('at')}"
                                            for nm, o in st['owner'].items())
                 + f" | ledige {sum(len(v) for v in st['free'].values())}, laget {st['spawns']}")
 

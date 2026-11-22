@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.302"
+VERSION = "0.94.303"
 
 
 def puppet_low_hp_pulse(now):
@@ -585,13 +585,31 @@ _log_lock = threading.Lock()
 SKIP = set()   # v0.57 feilsoking: delsystemer som hoppes over (/skip a,b,c)
 
 
+LOG_MAX_BYTES = 25 << 20
+_log_last = {}
+_log_n = [0]
+
+
 def log(msg):
     """Skriver til %APPDATA%\\OoT_Multiplayer\\log.txt og <exe-mappe>\\logs\\<PC>.log (delt mappe → begge sider ser)."""
+    now = time.time()
     line = f"{time.strftime('%Y-%m-%d %H:%M:%S')} [{PC}] v{VERSION} {msg}\n"
     with _log_lock:
+        # v0.94.303: identisk melding innen 60 s skrives ikke igjen (f.eks. «mål-patch» uten endring hvert 15. s)
+        t_ = _log_last.get(msg)
+        if t_ is not None and now - t_ < 60:
+            return
+        _log_last[msg] = now
+        if len(_log_last) > 4000:
+            for k in [k for k, v in _log_last.items() if now - v > 60]:
+                del _log_last[k]
+        _log_n[0] += 1
         for path in _LOG_FILES:
             try:
                 os.makedirs(os.path.dirname(path), exist_ok=True)
+                if _log_n[0] % 200 == 1 and os.path.exists(path) and os.path.getsize(path) > LOG_MAX_BYTES:
+                    # v0.94.303: over 25 MB -> <navn>.1.log (forrige .1 overskrives), så loggen aldri passerer ~50 MB
+                    os.replace(path, os.path.splitext(path)[0] + '.1' + os.path.splitext(path)[1])
                 with open(path, "a", encoding="utf-8") as f:
                     f.write(line)
             except OSError:
@@ -997,7 +1015,8 @@ def perf_report():
         return
     with _PERF_LK:
         items = sorted(_PERF.items(), key=lambda kv: -kv[1][1]); _PERF.clear(); _PERF_T0[0] = now
-    parts = [f"{k} {v[0] / span:.1f}/s {1000 * v[1] / span:.1f}ms/s maks {1000 * v[2]:.0f}ms" for k, v in items]
+    parts = [(f"{k} {v[0] / span:.1f}/s {v[1] / span / 1000:.1f} kB/s maks {v[2]:.0f} B" if k.endswith('-B')   # v0.94.303: bytes
+              else f"{k} {v[0] / span:.1f}/s {1000 * v[1] / span:.1f}ms/s maks {1000 * v[2]:.0f}ms") for k, v in items]
     log('ytelse (' + f'{span:.0f} s): ' + ' | '.join(parts))
 
 MODES = ['Story', 'PvP']   # v0.73
@@ -7680,7 +7699,12 @@ class App:
         om, ot, ch, cats = diff['only_mine'], diff['only_theirs'], diff['changed'], diff['cats']
         if not (om or ot or ch):
             log(f'assets-diff: LIKT med {fname} ({my_h})')
+            if getattr(self, '_assets_block', None):
+                self._assets_block = None
+                self.ui(self._append_chat_sys, f'✅ Game files now match {fname} – you can play together.')
             return
+        if self.cfg.get('require_same_assets', True):   # v0.94.303: ulike filer = ikke spill sammen (dukker/synk av)
+            self._assets_block = fa.get('s')
         log(f'assets-diff: ULIKE vs {fname} ({my_h} vs {fr_h}) – kategorier={cats}')
         for rel in om:
             sz, fh = mine[rel]
@@ -7693,6 +7717,11 @@ class App:
             log(f'assets-diff:   ulik: {rel} (meg {s1} B/{h1} vs {fname} {s2} B/{h2})')
         summary = f"⚠️ Assets mismatch vs {fname}: {', '.join(cats)} (kun meg {len(om)}, kun {fname} {len(ot)}, ulike {len(ch)}) – se /assets eller logg"
         self.ui(self._append_chat_sys, summary)
+        if getattr(self, '_assets_block', None):
+            names_ = [os.path.basename(r) for r in (list(om) + list(ot) + list(ch))[:4]]
+            self.ui(self._append_chat_sys, f"⛔ You can't play with {fname} until your game files match "
+                                           f"({', '.join(names_)}{' …' if len(om) + len(ot) + len(ch) > 4 else ''}). "
+                                           f"Both need the same mod version – update and restart the mod.")
 
     def _ctf_server_point(self, team):
         if self._server_cmd('score', team=team):
@@ -7765,7 +7794,8 @@ class App:
                         if bones_b64:
                             pkt["bones"] = bones_b64
                         try:
-                            self.gs.sendto(json.dumps(pkt, separators=(',', ':')).encode(), peer)
+                            _fp = json.dumps(pkt, separators=(',', ':')).encode(); self.gs.sendto(_fp, peer)
+                            self._fast_sent_t = time.time(); perf_add('fast-B', len(_fp))   # v0.94.303: state-pakken trenger da ikke posisjon/bein
                         except OSError:
                             pass
                     if self.pad.scene_changed and now < self.pad.suppress_warp_until:
@@ -8027,6 +8057,8 @@ class App:
                     continue
                 if t not in ("state", "fast"):
                     continue
+                if getattr(self, '_assets_block', None) and m.get("s") == self._assets_block:
+                    continue   # v0.94.303: ulike spillfiler – ingen dukke/synk med denne spilleren (chat og assets går fortsatt)
                 if self.peer is None:            # den andre koblet til oss – koble tilbake automatisk
                     self.connect(addr[0])
                 reset = m.get("s") != self.friend_session
@@ -11940,6 +11972,8 @@ class App:
         self._server_clock_worker = threading.Thread(target=loop, daemon=True, name='PvPServerClock')
         self._server_clock_worker.start()
 
+    SERVER_TIME_SCALE = 120   # = TIME_SCALE i server.py
+
     def _time_tick(self, now):
         pvp = getattr(self, 'mode', 'Story') == 'PvP'
         # v0.94.54: PvP-bakgrunnsskriving er midlertidig rullet tilbake etter gjentatt heng på begge PC-er.
@@ -11950,7 +11984,10 @@ class App:
         fresh = bool(self.friend and now - self.friend_t < 2)
         srv_st = getattr(self, '_server_state', None) or {}
         srv_dt = srv_st.get('day_time') if now - getattr(self, '_server_seen', 0) < 5.0 else None
-        srv_time = int(float(srv_dt)) % 86400 if isinstance(srv_dt, (int, float)) else None
+        # v0.94.303: serverklokka går 120 spillsek. per ekte sek. – regn verdien fram til nå (før kunne den være 1–3 s
+        # gammel = 2–6 spillminutter bak, og klokka ble «rettet» med et hopp hvert 15. s)
+        srv_time = (int(float(srv_dt) + max(0.0, min(5.0, now - getattr(self, '_server_seen', now))) * self.SERVER_TIME_SCALE) % 86400
+                    if isinstance(srv_dt, (int, float)) else None)
         srv_ww = srv_st.get('weather') if now - getattr(self, '_server_seen', 0) < 5.0 else None
         srv_ww = int(srv_ww) if isinstance(srv_ww, int) and 0 <= srv_ww < len(PadLink.WEATHERS) else None
         fw = srv_time if srv_time is not None else ((self.friend or {}).get('wtime') if fresh and not pvp else None)
@@ -11983,12 +12020,21 @@ class App:
                     self.set_check('clock', 'ok', f'{mine // 3600:02d}:{mine % 3600 // 60:02d} {vtxt}')
                 else:
                     self.set_check('clock', 'off', 'unknown')
-                if fw is not None and mine is not None and (srv_time is not None or (not pvp and not host)):
-                    d = abs(fw - mine); d = min(d, 86400 - d)
-                    if d > 300:
-                        if self.pad.write_time(self.p, fw):
+                fw_ = fw
+                if fw_ is not None and mine is not None and (srv_time is not None or (not pvp and not host)):
+                    if srv_time is not None:   # tiden som har gått siden avlesningen over (spillkall kan ta litt tid)
+                        fw_ = (fw_ + int((time.time() - now) * self.SERVER_TIME_SCALE)) % 86400
+                    d = abs(fw_ - mine); d = min(d, 86400 - d)
+                    if d > 120:   # v0.94.303: små rettinger (før 300 = 5 spillmin. hopp); logg bare store / et sammendrag
+                        if self.pad.write_time(self.p, fw_):
                             src = 'serverens' if srv_time is not None else 'vertens'
-                            log(f'tid: satt til {src} {fw // 3600:02d}:{fw % 3600 // 60:02d} (var {mine // 3600:02d}:{mine % 3600 // 60:02d})')
+                            st_ = self.__dict__.setdefault('_wt_stat', [0, 0, time.time()])
+                            st_[0] += 1; st_[1] = max(st_[1], d)
+                            if d > 900:
+                                log(f'tid: satt til {src} {fw_ // 3600:02d}:{fw_ % 3600 // 60:02d} (var {mine // 3600:02d}:{mine % 3600 // 60:02d})')
+                            elif time.time() - st_[2] > 300:
+                                log(f'tid: {st_[0]} små rettinger mot {src} klokke siste {int(time.time() - st_[2])} s (størst {st_[1]} spillsek.)')
+                                st_[:] = [0, 0, time.time()]
             except Exception as e:  # noqa: BLE001
                 log(f'tid: feil {e!r}')
             finally:
@@ -13100,8 +13146,22 @@ class App:
             _fb = self._flagbits_due()
             if _fb:
                 msg["flagbits"] = _fb   # bare når den er ny eller hvert 5. s (vennen beholder forrige)
+            # v0.94.303: mindre state-pakker. (1) Posisjon/rotasjon/bein/kontroller går allerede 60 Hz i «fast» – mottakeren
+            # ignorerer dem i state når fast er fersk, så de sendes ikke her da. (2) Bare endrede felt; full pakke hvert
+            # 1. s (mottakeren slår sammen med dict.update, så manglende felt beholder forrige verdi; tapt pakke rettes innen 1 s).
+            if time.time() - getattr(self, '_fast_sent_t', 0) < 0.3:
+                for k_ in ('pos', 'face', 'apos', 'arot', 'cam_a', 'pad', 'bones'):
+                    msg.pop(k_, None)
+            last_ = getattr(self, '_st_last', None)
+            full_ = last_ is None or now - getattr(self, '_st_full_t', 0) >= 1.0 or last_.get('s') != msg.get('s')
+            self._st_last = dict(msg)
+            if full_:
+                self._st_full_t = now
+            else:
+                msg = {k_: v_ for k_, v_ in msg.items() if k_ in ('t', 's', 'pt', 'pe', 'name') or last_.get(k_, msg) != v_}
             try:
-                _pk = json.dumps(msg).encode(); self.gs.sendto(_pk, self.peer); perf_add('pakke-kB', len(_pk) / 1024.0)
+                _pk = json.dumps(msg, separators=(',', ':')).encode(); self.gs.sendto(_pk, self.peer)
+                perf_add('state-B', len(_pk))
             except OSError:
                 pass
         self._drain_udp(now)

@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.298"
+VERSION = "0.94.299"
 
 
 def puppet_low_hp_pulse(now):
@@ -4573,6 +4573,22 @@ class PadLink:
                                 for m in self.BODY_SHOW:
                                     self.set_material_visible(p, act_, m, True)
                             else:
+                                # v0.94.299: etter sonebytte peker _tun_worn på det gamle plagget (120 m unna), men Linken har
+                                # fortsatt et farge-plagg på. Da skal grunn-tunikaen IKKE vises (ellers to farger samtidig).
+                                try:
+                                    dg_ = {}; self._scan_full_t = 0; self._scan_actors_raw(p, dg_)
+                                    lp_ = p.f32(act_ + 0x31C, 3)
+                                    new_arm = next((a_ for a_, nm_ in dg_.items() if nm_.startswith('Armor_Child_Tunic_')
+                                                    and math.dist(p.f32(a_ + 0x31C, 3), lp_) < 0.6), None)
+                                except OSError:
+                                    new_arm = None
+                                if new_arm is not None:
+                                    self.__dict__.setdefault('_tun_worn', {})[who_] = (new_arm, act_)
+                                    for m in self.TUNIC_SHOW:
+                                        self.set_material_visible(p, new_arm, m, True)
+                                        self.set_material_visible(p, act_, m, False)
+                                    log(f'tunika: {"Link 2" if who_ == "l2" else "min Link"} har fortsatt farge-plagg ({dg_[new_arm]}) etter sonebytte – grunn-tunikaen forblir skjult')
+                                    continue
                                 self.__dict__.get('_tun_worn', {}).pop(who_, None)
                                 for m in self.TUNIC_SHOW + ('Mt_Cloth_Pants',):
                                     self.set_material_visible(p, act_, m, True)

@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.294"
+VERSION = "0.94.295"
 
 
 def puppet_low_hp_pulse(now):
@@ -5332,14 +5332,14 @@ class App:
         self.follow_cb = tk.Checkbutton(top_in, text="FOLLOW", variable=self.tvang_var, command=self._tvang_toggled,
                        bg=PANEL, fg=FG, selectcolor=FIELD, activebackground=PANEL, activeforeground=GOLD,
                        font=("Segoe UI", 9))
-        # v0.94.294: navneskilt av/på (bare Story, som navneskiltene selv)
+        # v0.94.294: navneskilt av/på (v0.94.295: Story og PvP)
         self.names_var = tk.BooleanVar(value=bool(self.cfg.get("nameplates", True)))
         self.names_cb = tk.Checkbutton(top_in, text="NAMES", variable=self.names_var, command=self._names_toggled,
                        bg=PANEL, fg=FG, selectcolor=FIELD, activebackground=PANEL, activeforeground=GOLD,
                        font=("Segoe UI", 9))
         if self.cfg.get("mode") != "PvP":   # v0.79: FOLLOW finnes bare i Story
             self.follow_cb.pack(side="left", padx=(10, 0))
-            self.names_cb.pack(side="left", padx=(10, 0))
+        self.names_cb.pack(side="left", padx=(10, 0))   # v0.94.295: NAMES i både Story og PvP
 
         # --- Spill-status (to kolonner) og Nettverk side om side ---
         row = tk.Frame(root, bg=BG); row.pack(fill="x", padx=14, pady=(4, 4)); self._status_row = row
@@ -5843,21 +5843,43 @@ class App:
     GLYPH_W = 0.055           # v0.94.294: mindre bokstaver (skala 0,11, ~7 cm); v0.94.293: bare tekst (Kakariko-plakat, materiale «mask», skala 0,15) – tett som vanlig skrift
     GLYPH_H = 1.3             # plakatens origo over dukkens føtter (bokstaven ~0,1 m høy)
 
-    def _glyph_ok(self, ch):
+    GLYPH_TEAM = {'Red': 'R', 'Blue': 'B'}   # v0.94.295: PvP-lagfarge -> CoopGlyphR_/CoopGlyphB_ (hvit = CoopGlyph_)
+
+    def _glyph_actor(self, ch, col=''):
+        return f'CoopGlyph{col}_{ch}'
+
+    def _glyph_ok(self, ch, col=''):
+        key = self._glyph_actor(ch, col)
         have = self.__dict__.setdefault('_glyph_have', {})
-        if ch not in have:
-            have[ch] = os.path.isfile(os.path.join(TUNIC_DIR, 'romfs', 'Pack', 'Actor', f'{self.GLYPH_PREFIX}{ch}.pack.zs'))
-        return have[ch] and ch not in self.__dict__.setdefault('_glyph_bad', set())
+        if key not in have:
+            have[key] = os.path.isfile(os.path.join(TUNIC_DIR, 'romfs', 'Pack', 'Actor', f'{key}.pack.zs'))
+        return have[key] and key not in self.__dict__.setdefault('_glyph_bad', set())
 
     def _plate_text(self, nm):
         return ''.join(c for c in str(nm).upper() if c in self.GLYPH_CHARS and self._glyph_ok(c))[:10]
 
+    def _plate_glyphs(self, nm, col=''):
+        """Navnet som aktørnavn (ett per tegn), i lagfargen når den finnes – ellers hvitt."""
+        return tuple(self._glyph_actor(c, col) if col and self._glyph_ok(c, col) else self._glyph_actor(c)
+                     for c in self._plate_text(nm))
+
+    def _plate_colors(self, names):
+        """v0.94.295: PvP = lagfarge per spiller (rød/blå, tilskuer hvit); Story = hvit."""
+        if getattr(self, 'mode', 'Story') != 'PvP':
+            return {}
+        teams = {pe.get('name'): pe.get('team') for pe in (getattr(self, 'pvp_peers', ()) or ()) if isinstance(pe, dict)}
+        try:
+            teams[self.name] = self._active_pvp_team()
+        except Exception:  # noqa: BLE001
+            pass
+        return {nm: self.GLYPH_TEAM.get(teams.get(nm), '') for nm in names}
+
     def _coop_nameplates(self, p, now, entries, zone):
         pad = self.pad
         st = self.__dict__.setdefault('_glyph', {'zone': None})
-        on = bool(self.cfg.get('nameplates', True)) and getattr(self, 'mode', 'Story') == 'Story'
+        on = bool(self.cfg.get('nameplates', True)) and getattr(self, 'mode', 'Story') in ('Story', 'PvP')   # v0.94.295: også PvP
         if not on:
-            entries = ()   # slått av / PvP: alle tegn tilbake i bassenget og parkeres (under)
+            entries = ()   # slått av: alle tegn tilbake i bassenget og parkeres (under)
             if not st.get('owner'):
                 return
         if st.get('zone') != zone:
@@ -5868,14 +5890,16 @@ class App:
         names = {e[0]: e[1] for e in entries}
         if on and self.cfg.get('nameplate_self', True) and pad.p_act is not None and self.name not in names:
             names[self.name] = pad.p_act   # v0.94.294: eget navn over egen Link også
+        cols = self._plate_colors(names)
+        glyphs = {nm: self._plate_glyphs(nm, cols.get(nm, '')) for nm in names}
         if st['known'] is None:
             # tegn som finnes fra før (forrige modd-start i samme spill/sone) gjenbrukes
             if not names or pad.event_busy(p) is not None:
                 return
             st['known'] = set()
             n_ = 0
-            for ch in {c for nm in names for c in self._plate_text(nm)}:
-                for a0 in (pad._list_actors_raw(p, prefix=self.GLYPH_PREFIX + ch) or {}):
+            for ch in {g for nm in names for g in glyphs[nm]}:
+                for a0 in (pad._list_actors_raw(p, prefix=ch) or {}):
                     x0 = pad.actor_x8(p, a0)
                     if x0 and pad.navi_ready(p, a0, x0):
                         st['free'].setdefault(ch, []).append((a0, x0)); n_ += 1
@@ -5883,15 +5907,16 @@ class App:
             if n_:
                 log(f'navneskilt: gjenbruker {n_} tegn som fantes fra før')
         for nm in list(st['owner']):   # spilleren er borte eller navnet endret: tegnene tilbake i bassenget
-            if nm not in names or st['owner'][nm]['text'] != self._plate_text(nm):
+            if nm not in names or st['owner'][nm]['glyphs'] != glyphs[nm]:   # også nytt lag = ny farge
                 for sl in st['owner'].pop(nm)['slots']:
                     if sl:
                         st['free'].setdefault(sl[0], []).append(sl[1:])
         for nm in names:
-            txt = self._plate_text(nm)
+            txt = glyphs[nm]
             if not txt:
                 continue
-            o = st['owner'].setdefault(nm, {'text': txt, 'slots': [None] * len(txt)})
+            o = st['owner'].setdefault(nm, {'text': self._plate_text(nm), 'glyphs': txt, 'col': cols.get(nm, ''),
+                                            'slots': [None] * len(txt)})
             for i, ch in enumerate(txt):
                 if o['slots'][i] is not None:
                     continue
@@ -5909,13 +5934,13 @@ class App:
 
                 def _spawn(ch=ch, pos=(lp[0], lp[1] - 3.0, lp[2])):
                     try:
-                        r = pad.create_actor(p, self.GLYPH_PREFIX + ch, list(pos))
+                        r = pad.create_actor(p, ch, list(pos))
                         if not r:   # spillet kjenner ikke aktøren (pakket etter spillstart)
                             self.__dict__.setdefault('_glyph_bad', set()).add(ch); st['spawns'] -= 1
-                            log(f'navneskilt: {self.GLYPH_PREFIX}{ch} kunne ikke lages – start spillet på nytt etter pakking')
+                            log(f'navneskilt: {ch} kunne ikke lages – start spillet på nytt etter pakking')
                             return
                         time.sleep(1.0)
-                        found = pad._list_actors_raw(p, prefix=self.GLYPH_PREFIX + ch) or {}
+                        found = pad._list_actors_raw(p, prefix=ch) or {}
                         mine = {sl[1] for o_ in st['owner'].values() for sl in o_['slots'] if sl} | {a for v in st['free'].values() for a, _ in v}
                         new = [a for a in found if a not in st['known'] and a not in mine]
                         for a in new:
@@ -5923,7 +5948,7 @@ class App:
                             x8 = pad.actor_x8(p, a)
                             if x8 and pad.navi_ready(p, a, x8):
                                 st['free'].setdefault(ch, []).append((a, x8))
-                        log(f'navneskilt: laget {self.GLYPH_PREFIX}{ch} -> {r}, {len(new)} ny(e)')
+                        log(f'navneskilt: laget {ch} -> {r}, {len(new)} ny(e)')
                     except Exception as e:  # noqa: BLE001
                         log(f'navneskilt: spawn-feil {e!r}')
                     finally:
@@ -5971,7 +5996,7 @@ class App:
                         pass
         if now - st.get('log_t', 0) > 15 and st['owner']:
             st['log_t'] = now
-            log('navneskilt: ' + ', '.join(f"{nm} '{o['text']}' {sum(1 for s in o['slots'] if s)}/{len(o['slots'])}"
+            log('navneskilt: ' + ', '.join(f"{nm} '{o['text']}'{('/' + o['col']) if o.get('col') else ''} {sum(1 for s in o['slots'] if s)}/{len(o['slots'])}"
                                            for nm, o in st['owner'].items())
                 + f" | ledige {sum(len(v) for v in st['free'].values())}, laget {st['spawns']}")
 
@@ -6018,8 +6043,7 @@ class App:
             self._pvp_spawn = None; self._pvp_on_since = time.time()
             log(f'modus valgt: {md}')
             if md == 'PvP':   # v0.79: FOLLOW bare i Story
-                self.follow_cb.pack_forget()
-                self.names_cb.pack_forget()
+                self.follow_cb.pack_forget()   # v0.94.295: NAMES blir stående (navneskilt i lagfarge i PvP)
                 self._pvp_lobby_done = False
                 self._pvp_travel_retry = 0
                 self._pvp_in_arena = False; self._pvp_social_lobby = False
@@ -6028,8 +6052,8 @@ class App:
                 self.story_lobby_outer.pack_forget()
                 self.lobby_outer.pack(fill='x', padx=14, pady=4, before=self._status_row)
             else:
-                self.names_cb.pack(side="right")
-                self.follow_cb.pack(side="right")
+                if not self.follow_cb.winfo_manager():
+                    self.follow_cb.pack(side="left", padx=(10, 0), before=self.names_cb)
                 self.lobby_outer.pack_forget()
                 self.story_lobby_outer.pack(fill='x', padx=14, pady=4, before=self._status_row)
                 self._pvp_in_arena = False; self._pvp_social_lobby = False

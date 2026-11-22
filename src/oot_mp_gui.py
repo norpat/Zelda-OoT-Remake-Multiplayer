@@ -5587,7 +5587,9 @@ class App:
         chat_outer.pack(fill="both", expand=True, padx=14, pady=(4, 12))
         chat_frame = tk.Frame(chat_outer, bg=PANEL); chat_frame.pack(fill="both", expand=True)
         chat_hdr = tk.Frame(chat_frame, bg=PANEL); chat_hdr.pack(fill="x", padx=10, pady=(6, 0))
-        ttk.Button(chat_hdr, text="Commands", command=self._show_commands).place(relx=1.0, rely=0.5, anchor="e")
+        self.cmd_btn = ttk.Button(chat_hdr, text="Commands", command=self._show_commands)   # v0.94.298: bare for Story-hosten
+        self.cmd_btn.place(relx=1.0, rely=0.5, anchor="e")
+        self.root.after(1500, self._cmd_btn_tick)
         tk.Label(chat_hdr, text="Chat", bg=PANEL, fg=GOLD, font=(ZELDA_FONT, 17, "bold")).pack(anchor="center")
         chat_in_row = tk.Frame(chat_frame, bg=PANEL)
         chat_in_row.pack(side="bottom", fill="x", padx=10, pady=(4, 8))
@@ -5736,10 +5738,37 @@ class App:
             return True
         return False
 
-    def _coop_fairies(self, p, now, entries, zone):
-        if not self.cfg.get('coop_fairies', True) or getattr(self, 'mode', 'Story') not in ('Story', 'PvP'):   # v0.94.298: også PvP
-            return
+    def _fairy_park_leftovers(self, p, now, zone):
+        """v0.94.298: feer fra Story (eller før modd-omstart) ble hengende i lufta i PvP. Våre CoopFairy (aldri spillets
+        Dm_Npc_Navi) parkeres 3 m under bakken, én gang per sone, når sonen er ferdig lastet."""
         pad = self.pad
+        st = self.__dict__.setdefault('_fairy_off', {})
+        if st.get('zone') == zone or self.fairy_actor != self.FAIRY_COOP:
+            return
+        if (not pad.cur_banc or now - getattr(pad, '_banc_since', now) < 12.0 or now < getattr(pad, '_tp_t', 0) + 8.0
+                or not pad._zone_ready(p, now)):
+            return
+        st['zone'] = zone
+        n = 0
+        self.__dict__.pop('_fairy', None)   # Story-tilstanden gjelder ikke lenger
+        for a0 in (pad._list_actors_raw(p, prefix=self.FAIRY_COOP) or {}):
+            x0 = pad.actor_x8(p, a0)
+            if x0 and pad.navi_ready(p, a0, x0):
+                try:
+                    lp = p.f32(pad.p_act + 0x31C, 3)
+                    self._fairy_move(p, a0, x0, (lp[0], lp[1] - 3.0, lp[2]))
+                    n += 1
+                except OSError:
+                    pass
+        if n:
+            log(f'fe: parkerte {n} fe(er) under bakken (ikke Story)')
+
+    def _coop_fairies(self, p, now, entries, zone):
+        pad = self.pad
+        if not self.cfg.get('coop_fairies', True) or getattr(self, 'mode', 'Story') != 'Story':   # bare Story (ingen feer i PvP)
+            self._fairy_park_leftovers(p, now, zone)
+            return
+        self.__dict__.pop('_fairy_off', None)   # tilbake i Story: parker på nytt neste gang det byttes bort
         st = self.__dict__.setdefault('_fairy', {'zone': None})
         if st.get('zone') != zone:
             st.clear(); st.update(zone=zone, pool=[], owner={}, parked=set(), spawns=0, spawn_t=0.0, busy=False, known=None)
@@ -6420,6 +6449,15 @@ class App:
         if not txt:
             return
         low = __import__('unicodedata').normalize('NFKC', txt).lower().strip()
+        if low.startswith('/') and not getattr(self, '_remote_run', False) and not self._cmd_allowed():
+            self.chat_var.set("")   # v0.94.298: sendes heller ikke som chat
+            if getattr(self, 'mode', 'Story') != 'Story':
+                self._append_chat_sys('Commands are off in PvP.')
+            else:
+                host = ((getattr(self, '_server_state', None) or {}).get('lobby') or {}).get('host')
+                self._append_chat_sys(f"Only the host{f' ({host})' if host else ''} can use commands.")
+            log(f'kommando avvist (ikke Story-host): {txt[:40]}')
+            return
         if low.startswith('/mode'):
             self.chat_var.set("")
             requested = next((m for m in MODES if low == f'/mode {m.lower()}'), None)
@@ -8486,8 +8524,12 @@ class App:
             if line.lower().split()[0] in self.INFO_CMDS:
                 threading.Thread(target=self._info_cmd, args=(line,), daemon=True).start()
             else:
-                def run(t=line):
-                    self.chat_var.set(t); self._send_chat()
+                def run(t=line):   # fjernstyring for testing (fil ved exe-en) går forbi host-sperren
+                    self._remote_run = True
+                    try:
+                        self.chat_var.set(t); self._send_chat()
+                    finally:
+                        self._remote_run = False
                 self.ui(run)
 
     INFO_CMDS = ('/zone', '/spawn', '/plates', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
@@ -8912,6 +8954,26 @@ class App:
         angle = math.atan2(-dx, dz) - cam
         strength = min(1.0, max(0.25, distance / 1.5))
         self._bot_input(0, -strength * math.sin(angle), strength * math.cos(angle))
+
+    def _cmd_allowed(self):
+        """v0.94.298: chat-kommandoer bare for hosten i Story. I PvP kan ingen bruke dem (juks)."""
+        if getattr(self, 'mode', 'Story') != 'Story':
+            return False
+        host = ((getattr(self, '_server_state', None) or {}).get('lobby') or {}).get('host')
+        if host:
+            return host == getattr(self, 'name', None)
+        return self._time_host()
+
+    def _cmd_btn_tick(self):
+        try:
+            ok = self._cmd_allowed()
+            if ok and not self.cmd_btn.winfo_ismapped():
+                self.cmd_btn.place(relx=1.0, rely=0.5, anchor="e")
+            elif not ok and self.cmd_btn.winfo_ismapped():
+                self.cmd_btn.place_forget()
+        except Exception:  # noqa: BLE001
+            pass
+        self.root.after(1500, self._cmd_btn_tick)
 
     def _show_commands(self):
         for line in ("Commands (type in the chat, Enter sends):",

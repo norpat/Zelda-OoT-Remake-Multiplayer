@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.299"
+VERSION = "0.94.300"
 
 
 def puppet_low_hp_pulse(now):
@@ -6470,7 +6470,7 @@ class App:
             if getattr(self, 'mode', 'Story') != 'Story':
                 self._append_chat_sys('Commands are off in PvP.')
             else:
-                host = ((getattr(self, '_server_state', None) or {}).get('lobby') or {}).get('host')
+                host = (self.friend or {}).get('name')
                 self._append_chat_sys(f"Only the host{f' ({host})' if host else ''} can use commands.")
             log(f'kommando avvist (ikke Story-host): {txt[:40]}')
             return
@@ -8972,12 +8972,11 @@ class App:
         self._bot_input(0, -strength * math.sin(angle), strength * math.cos(angle))
 
     def _cmd_allowed(self):
-        """v0.94.298: chat-kommandoer bare for hosten i Story. I PvP kan ingen bruke dem (juks)."""
+        """v0.94.298: chat-kommandoer bare for hosten i Story. I PvP kan ingen bruke dem (juks).
+        v0.94.300: Story-hosten = den som står som «Host» i Nettverk-panelet (_time_host, kan byttes ved klikk) –
+        ikke serverens Public-lobby-host (den var en annen spiller enn den vinduet viste)."""
         if getattr(self, 'mode', 'Story') != 'Story':
             return False
-        host = ((getattr(self, '_server_state', None) or {}).get('lobby') or {}).get('host')
-        if host:
-            return host == getattr(self, 'name', None)
         return self._time_host()
 
     def _cmd_btn_tick(self):

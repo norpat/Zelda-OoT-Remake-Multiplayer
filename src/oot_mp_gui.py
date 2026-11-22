@@ -46,7 +46,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.295"
+VERSION = "0.94.296"
 
 
 def puppet_low_hp_pulse(now):
@@ -5863,6 +5863,24 @@ class App:
         return tuple(self._glyph_actor(c, col) if col and self._glyph_ok(c, col) else self._glyph_actor(c)
                      for c in self._plate_text(nm))
 
+    def _plate_pos(self, p, a, st):
+        """v0.94.296: der figuren faktisk tegnes = fysikk-kroppens matrise (x8 +0x1DC/+0x1EC/+0x1FC). akt+0x31C kunne stå
+        igjen etter teleport (PvP-lobbyen: navnet 10 m foran Link). Reserve: +0x31C."""
+        pad = self.pad
+        c = st.setdefault('x8c', {})
+        x8 = c.get(a)
+        if x8 is None:
+            x8 = c[a] = pad.actor_x8(p, a) or 0
+        try:
+            if x8:
+                t = (p.f32(x8 + 0x1DC), p.f32(x8 + 0x1EC), p.f32(x8 + 0x1FC))
+                if all(math.isfinite(v) and abs(v) < 1e5 for v in t) and abs(t[0]) + abs(t[1]) + abs(t[2]) > 1.0:
+                    return t
+            return p.f32(a + 0x31C, 3)
+        except OSError:
+            c.pop(a, None)
+            return None
+
     def _plate_colors(self, names):
         """v0.94.295: PvP = lagfarge per spiller (rød/blå, tilskuer hvit); Story = hvit."""
         if getattr(self, 'mode', 'Story') != 'PvP':
@@ -5898,12 +5916,14 @@ class App:
                 return
             st['known'] = set()
             n_ = 0
-            for ch in {g for nm in names for g in glyphs[nm]}:
-                for a0 in (pad._list_actors_raw(p, prefix=ch) or {}):
+            # v0.94.296: alle tegn i alle farger (også gamle lagfarger fra før modd-omstart) – ellers ble de hengende i lufta
+            for a0, d0 in (pad._list_actors_raw(p, prefix='CoopGlyph') or {}).items():
+                ch = d0[0] if isinstance(d0, (tuple, list)) and d0 else None
+                if isinstance(ch, str) and ch.startswith('CoopGlyph'):
                     x0 = pad.actor_x8(p, a0)
                     if x0 and pad.navi_ready(p, a0, x0):
                         st['free'].setdefault(ch, []).append((a0, x0)); n_ += 1
-                    st['known'].add(a0)
+                st['known'].add(a0)
             if n_:
                 log(f'navneskilt: gjenbruker {n_} tegn som fantes fra før')
         for nm in list(st['owner']):   # spilleren er borte eller navnet endret: tegnene tilbake i bassenget
@@ -5954,26 +5974,33 @@ class App:
                     finally:
                         st['busy'] = False
                 threading.Thread(target=_spawn, daemon=True, name='GlyphSpawn').start()
-        # snu mot kameraet (øyet), ellers mot egen Link
-        eye = None
+        # v0.94.296: skiltene står parallelt med skjermen (vendt mot kameraets synsretning). Før: snudd mot kamera-øyet,
+        # men når kameraadressen var tapt (cam_off None/ugyldig) ble de snudd mot egen Link -> speilvendt tekst når man
+        # snudde kameraet. my_cam_angle har spillets egen kameravinkel (s13 - s9) som reserve – den brukes også av styringen.
+        cam_a = None
         try:
-            if getattr(self, 'cam_off', None) is not None:
-                eye = read_cam(p, self.cam_off)[3]
-            if eye is None or not all(math.isfinite(v) for v in eye):
+            cam_a = pad.my_cam_angle(p, getattr(self, 'cam_off', None))
+        except Exception:  # noqa: BLE001
+            cam_a = None
+        eye = None
+        if cam_a is None:
+            try:
                 eye = p.f32(pad.p_act + 0x31C, 3)
-        except (OSError, TypeError):
-            eye = None
+            except (OSError, TypeError):
+                eye = None
         yoff = math.radians(float(self.cfg.get('glyph_yaw_off', 0)))
         for nm, o in st['owner'].items():
             if nm not in names:
                 continue
-            try:
-                lp = p.f32(names[nm] + 0x31C, 3)
-            except OSError:
+            lp = self._plate_pos(p, names[nm], st)
+            if lp is None:
                 continue
             base = (lp[0], lp[1] + float(self.cfg.get('glyph_height', self.GLYPH_H)), lp[2])
             o['at'] = (round(lp[0], 1), round(lp[1], 1), round(lp[2], 1))
-            yaw = math.atan2(eye[0] - base[0], eye[2] - base[2]) if eye else 0.0
+            if cam_a is not None:
+                yaw = cam_a + math.pi   # skiltets forside mot kameraet (motsatt synsretningen)
+            else:
+                yaw = math.atan2(eye[0] - base[0], eye[2] - base[2]) if eye else 0.0
             yaw += yoff
             rx, rz = math.cos(yaw), -math.sin(yaw)   # skiltets +X (leseretning) i verden
             n_ = len(o['slots'])
@@ -5999,7 +6026,8 @@ class App:
             st['log_t'] = now
             log('navneskilt: ' + ', '.join(f"{nm} '{o['text']}'{('/' + o['col']) if o.get('col') else ''} {sum(1 for s in o['slots'] if s)}/{len(o['slots'])} @{o.get('at')}"
                                            for nm, o in st['owner'].items())
-                + f" | ledige {sum(len(v) for v in st['free'].values())}, laget {st['spawns']}")
+                + f" | ledige {sum(len(v) for v in st['free'].values())}, laget {st['spawns']}"
+                + f" | kamera {'-' if cam_a is None else round(math.degrees(cam_a))}° ({'matrise' if getattr(self, 'cam_off', None) else 'spillvinkel'})")
 
     def _names_toggled(self):
         self.cfg["nameplates"] = bool(self.names_var.get()); save_cfg(self.cfg)

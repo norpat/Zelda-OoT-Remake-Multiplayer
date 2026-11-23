@@ -12,6 +12,7 @@ if os.name == "nt":
     except Exception:
         pass
 import tkinter as tk
+import traceback
 import zlib
 import tkinter.messagebox
 from tkinter import ttk
@@ -46,7 +47,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.303"
+VERSION = "0.94.320"
 
 
 def puppet_low_hp_pulse(now):
@@ -629,6 +630,22 @@ def save_cfg(c):
     os.makedirs(CFG_DIR, exist_ok=True)
     with open(CFG, "w", encoding="utf-8") as f:
         json.dump(c, f, indent=2)
+    write_look_copy(c.get("look"))
+
+
+def write_look_copy(look):
+    """v0.94.308: kopi av valgt tunikafarge ved siden av exe-en (look.txt). auto_restart.py leser den først:
+    startes spillet fra et annet miljø (annen APPDATA) fikk egen Link feil grunnfarge, og fargeplagget oppå
+    ga to tunikaer som flimret (hvit Link som blinket cyan, 2026-11-23)."""
+    if look not in LOOKS:
+        return
+    try:
+        d = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) else os.path.dirname(os.path.abspath(__file__))
+        f = os.path.join(d, "look.txt")
+        if not os.path.isfile(f) or open(f, encoding="utf-8").read().strip() != look:
+            open(f, "w", encoding="utf-8").write(look)
+    except OSError:
+        pass
 
 
 def local_ips():
@@ -3091,12 +3108,25 @@ class PadLink:
             if self._u64(p, me_node + 0x10) != self.p_act + delta:
                 self._list_why = "Link-noden peker ikke tilbake"
                 return None
+            seen_offs = self.__dict__.setdefault('_list_offs', set())
+
             def _ok(nd):   # ekte node: eier ligger 0x538 (aktør) eller 0x3A0/0x3A8 (andre objekter) før noden
                 try:
                     o_ = self._u64(p, nd + 0x10)
                 except OSError:
                     return False
-                return bool(o_) and (nd - o_) in (0x538, 0x3A0, 0x3A8)
+                if not o_:
+                    return False
+                off_ = nd - o_
+                if off_ in (0x538, 0x3A0, 0x3A8):
+                    return True
+                # v0.94.317: Kokiri-skogen har noder med annen avstand (lista stoppet etter 1 node – «rar lengde 1»,
+                # dukker og kule ble aldri funnet). Godta rimelig avstand og logg den første gangen.
+                if 0x10 <= off_ <= 0x2000 and off_ % 8 == 0:
+                    if off_ not in seen_offs:
+                        seen_offs.add(off_); log(f'aktørliste: ny node-avstand 0x{off_:X} i {self.cur_banc}')
+                    return True
+                return False
             first = me_node; back = 0
             while back < 6000:
                 pv = self._u64(p, first + 8)
@@ -3193,6 +3223,8 @@ class PadLink:
             del q
         if full:
             self._scan_full_t = now; self._scan_banc = self.cur_banc
+            if diag is not None:   # v0.94.304: siste fulle liste kan gjenbrukes (tunika-vakta)
+                self._last_full_diag = (now, self.cur_banc, dict(diag))
         self._scan_pages = {pg for pg in pages if lo <= pg < hi} | (set() if full else self._scan_pages)
         return found
 
@@ -3462,6 +3494,10 @@ class PadLink:
             if (not self.cur_banc
                     or now_t - getattr(self, '_banc_since', now_t) < 12.0
                     or now_t < getattr(self, '_tp_t', 0) + 8.0):
+                # v0.94.311: for tidlig (rett etter teleport/sonebytte) – ikke tell dette som et forsøk. Før ble det siste av
+                # to forsøk brukt opp her i PvP-arenaen (hyppige teleporter), og egen Link fikk aldri ny farge (GAMER: Purple).
+                if who == 'me':
+                    log(f'tunika: venter – rett etter teleport/sonebytte ({look})')
                 return
             name = f'Armor_Child_Tunic_{TUNIC_LETTER[look]}'
             for m in self.TUNIC_SHOW + ('Mt_Cloth_Pants',):   # v0.94.24: vis vanlig tunika mens den nye lages (ellers «Link uten tunika og lue» en stund)
@@ -3469,6 +3505,8 @@ class PadLink:
             a = c_act + d
             eu = self._u64v(p, self._u64v(p, a + 0x270) + 0x200)
             if not eu:
+                if who == 'me':
+                    log(f'tunika: fant ikke utstyrskomponenten til min Link ({look}) – prøver igjen')
                 return
             # navnet i patch-området R+0x7C0 (vert hR) – F_ALLOC-minne var ikke alltid koblet likt (spillet leste nuller)
             p.write(p.base + self.hR + 0x7C0, name.encode()[:0x37] + bytes(0x38 - min(len(name), 0x37)))
@@ -3524,6 +3562,7 @@ class PadLink:
                 self.__dict__[{'l2': '_tun_done', 'me': '_tun_done_me'}.get(who, '_tun_done_bot')] = (copy, look)
                 log(f"tunika: {'Link 2' if who == 'l2' else 'min Link'} har allerede {name} på – tar ikke på igjen")
                 return
+            equip_called = (copy, look)   # v0.94.313: F_EQUIP aldri to ganger for samme farge, heller ikke etter et unntak
             r = self.game_call(p, self.F_EQUIP, (eu, 8, self.R + 0x7F8, 2, 0xFFFFFFFFFFFFFFFF, 1, 0), timeout=3.0)
             who_label = 'Link 2' if who == 'l2' else 'min Link'
             log(f'tunika: {who_label} tar på {name} -> {r}')
@@ -3576,6 +3615,8 @@ class PadLink:
             log(f'tunika: {"Link 2" if who == "l2" else "min Link"} har {look} tunika ({name} @0x{arm:X})')
         except Exception as e:  # noqa: BLE001
             log(f'tunika: feil {e!r}')
+            if 'equip_called' in locals():
+                self.__dict__[{'l2': '_tun_fail', 'me': '_tun_fail_me'}.get(who, '_tun_fail_bot')] = (copy, look)
         finally:
             self._tun_busy = False
 
@@ -3605,6 +3646,12 @@ class PadLink:
             rec[2] = hid; rec[(0x2C4 - 0x240) // 4] = hid; rec[3] = 0
             at = p.f32(victim + 0x31C, 3)
             frm = p.f32(attacker + 0x31C, 3) if attacker is not None else at
+            # v0.94.309: treff på avstand (sprettert, 6,7 m) ble ikke tatt av spillet (HP ikke trukket, ingen reaksjon).
+            # Legg angrepsstedet maks 1,2 m fra offeret i angriperens retning, som et nærslag.
+            ddx, ddz = frm[0] - at[0], frm[2] - at[2]
+            dd = math.hypot(ddx, ddz)
+            if dd > 1.2:
+                frm = [at[0] + ddx / dd * 1.0, at[1], at[2] + ddz / dd * 1.0]
             if heavy:   # skyv angrepsstedet litt lenger bort -> kraftigere tilbakeslag? (spillet bestemmer selv)
                 frm = [at[i] + (frm[i] - at[i]) * 2.0 for i in range(3)]
             raw = bytearray(struct.pack('<38I', *rec))
@@ -4550,7 +4597,16 @@ class PadLink:
                 want[self.p_act] = f"Armor_Child_Tunic_{TUNIC_LETTER[self.my_look]}"
             def _dup(want=want):
                 try:
-                    dg = {}; self._scan_full_t = 0; self._scan_actors_raw(p, dg)
+                    # v0.94.304: før tvang vi et fullt aktørsøk (~1,5 GB lest) hvert 5. s = ~35 % av moddens CPU.
+                    # Gjenbruk siste fulle liste (< 30 s, samme sone), ellers fullt søk høyst hvert 30. s.
+                    lf_ = getattr(self, '_last_full_diag', None)
+                    if lf_ and time.time() - lf_[0] < 30 and lf_[1] == self.cur_banc:
+                        dg = lf_[2]
+                    elif time.time() - getattr(self, '_tun_dup_full_t', 0) >= 30:
+                        self._tun_dup_full_t = time.time()
+                        dg = {}; self._scan_full_t = 0; self._scan_actors_raw(p, dg)
+                    else:
+                        return
                     hid = self.__dict__.setdefault('_tun_dup_hidden', set())
                     for a_, nm_ in dg.items():
                         if not nm_.startswith('Armor_Child_Tunic_') or a_ in hid:
@@ -4626,7 +4682,7 @@ class PadLink:
         # (frysen i v0.94.222 kom trolig av at vakta tok på samme stykke igjen; daurosk: equip bare når navnet avviker).
         _tried = self.__dict__.setdefault('_own_tun_tried', {})   # (spiller, farge) -> antall forsøk (1 = last pakken, 2 = ta på)
         if (ml in TUNIC_LETTER and self.player is not None and self.p_act is not None
-                and _tried.get((self.player, ml), 0) < 2
+                and _tried.get((self.player, ml), 0) < 20   # v0.94.313: forsøk før F_EQUIP er gratis; F_EQUIP kalles maks én gang (done/fail)
                 and getattr(self, '_tun_done_me', None) != (self.player, ml) and getattr(self, '_tun_fail_me', None) != (self.player, ml)
                 and now - getattr(self, '_tun_try', 0) > 5.0
                 and not getattr(self, '_tun_busy', False) and not getattr(self, '_spawning', False)
@@ -5352,6 +5408,7 @@ class App:
         tk.Label(top_in, text="Link", bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(side="left")
         self.look = {'Vanlig': 'Normal', 'Uten trøye': 'No tunic'}.get(self.cfg.get("look"), self.cfg.get("look"))
         self.look = self.cfg.get("look") if self.cfg.get("look") in LOOKS else 'Red'
+        write_look_copy(self.look)
         self.look_var = tk.StringVar(value=self.look)
         self.pad.my_look = self.look
         try:   # v0.94.279: fargen auto_restart la i romfs ved spillstart
@@ -5546,10 +5603,24 @@ class App:
                                       borderwidth=0, font=('Segoe UI', 9))
         self.lobby_games.pack(fill='x', padx=10, pady=3)
         self.lobby_games.bind('<Double-Button-1>', lambda _e: self._lobby_join())
+        # v0.94.316/320: brettvalg. CTF bare på brett med 'ctf' (Gohma, Zora's Domain); Deathmatch på alle.
+        self.arena_var = tk.StringVar(value=self.cfg.get('arena_pick') if self.cfg.get('arena_pick') in self.ARENAS else 'gohma')
+        _arena = lambda: (self.arena_var.get() if (_gmode() == 'deathmatch' or self.ARENAS.get(self.arena_var.get(), {}).get('ctf'))
+                          else 'gohma')
+        self.arena_row = tk.Frame(self.mode_opts, bg=PANEL)
+        tk.Label(self.arena_row, text='Arena:', bg=PANEL, fg=MUTED, font=('Segoe UI', 9)).pack(side='left')
+        self._arena_radios = {}
+        for _k, _lbl in (('gohma', 'Gohma room'), ('sword', 'Sword course (rolling boulder)'), ('zora', "Zora's Domain")):
+            self._arena_radios[_k] = tk.Radiobutton(self.arena_row, text=_lbl, value=_k, variable=self.arena_var, bg=PANEL, fg=FG, selectcolor=FIELD,
+                           activebackground=PANEL, activeforeground=GOLD, font=('Segoe UI', 9),
+                           command=lambda: (self.cfg.__setitem__('arena_pick', self.arena_var.get()), save_cfg(self.cfg))
+                           )
+            self._arena_radios[_k].pack(side='left', padx=4)
         r1 = tk.Frame(self.mode_opts, bg=PANEL); r1.pack(fill='x', padx=10, pady=2)
-        ttk.Button(r1, text='Host 2v2', command=lambda: self._server_cmd('create', size=4, game_mode=_gmode())).pack(side='left')
-        ttk.Button(r1, text='Host 5v5', command=lambda: self._server_cmd('create', size=10, game_mode=_gmode())).pack(side='left', padx=4)
-        ttk.Button(r1, text='Host 25v25', command=lambda: self._server_cmd('create', size=50, game_mode=_gmode())).pack(side='left')
+        ttk.Button(r1, text='Host 1v1', command=lambda: self._server_cmd('create', size=2, game_mode=_gmode(), arena=_arena())).pack(side='left')
+        ttk.Button(r1, text='Host 2v2', command=lambda: self._server_cmd('create', size=4, game_mode=_gmode(), arena=_arena())).pack(side='left', padx=4)
+        ttk.Button(r1, text='Host 5v5', command=lambda: self._server_cmd('create', size=10, game_mode=_gmode(), arena=_arena())).pack(side='left')
+        ttk.Button(r1, text='Host 25v25', command=lambda: self._server_cmd('create', size=50, game_mode=_gmode(), arena=_arena())).pack(side='left', padx=4)
         ttk.Button(r1, text='Spectate', command=self._lobby_watch).pack(side='right')
         ttk.Button(r1, text='Join', command=self._lobby_join).pack(side='right', padx=4)
         sec('YOUR GAME').pack(fill='x', padx=10, pady=(8, 0))
@@ -5966,6 +6037,171 @@ class App:
             pass
         return {nm: self.GLYPH_TEAM.get(teams.get(nm), '') for nm in names}
 
+    # ------------------------------------------------------------------ v0.94.307: Z-sikting (Navi) på andre spillere
+    # Dukkene kan ikke siktes på (ingen AttentionSender; å legge den inn i dukkepakkene gjorde at de ikke ble laget).
+    # tools/target_pack.py lager CoopTarget_E: treskilt-aktøren med fiendens AttentionSender (EnemyCommon LockOn/AutoAim)
+    # og usynlig modell. Én per motstander, flyttet til dukkens bryst hver tikk (som navneskiltene). Testet 2026-11-23:
+    # Z ved målet -> LockOnWait/LockOnTurn; Z uten mål -> Wait. Standard bare i PvP (cfg z_target: pvp|all|off).
+    ZTGT_ACTOR = 'CoopTarget_E'
+    ZTGT_H = 1.6   # v0.94.309: 0.9 ga låsepilen under bakken på GAMER; 1.6 bekreftet over bakken (2026-11-23)
+
+    def _z_opponents(self, names):
+        mode = str(self.cfg.get('z_target', 'pvp')).lower()
+        cur = getattr(self, 'mode', 'Story')
+        if mode == 'off' or (mode == 'pvp' and cur != 'PvP'):
+            return set()
+        if cur != 'PvP':
+            return set(names)
+        teams = {pe.get('name'): pe.get('team') for pe in (getattr(self, 'pvp_peers', ()) or ()) if isinstance(pe, dict)}
+        try:
+            mine = self._active_pvp_team()
+        except Exception:  # noqa: BLE001
+            mine = None
+        # lagspill: bare motstanderlaget; deathmatch/uten lag: alle
+        return {nm for nm in names if not (mine in ('Red', 'Blue') and teams.get(nm) == mine)}
+
+    def _nearest_opp_puppet(self):
+        """v0.94.307: nærmeste motstander-dukke (vert-offset) – angriperen for tilbakeslag når Link 2 (c_act) ikke finnes."""
+        try:
+            seen_t, pups = getattr(self, '_puppets_seen', (0, {}))
+            me = self.pad.my_apos(self.p)
+            if time.time() - seen_t > 1.0 or not pups or not me:
+                return None
+            opp = self._z_opponents_pvp(pups)
+            best = None
+            for nm_, act_ in pups.items():
+                if nm_ in opp:
+                    pos_ = self.p.f32(act_ + 0x31C, 3)
+                    dd = math.dist(pos_, me)
+                    if best is None or dd < best[0]:
+                        best = (dd, act_)
+            return best[1] if best else None
+        except Exception:  # noqa: BLE001
+            return None
+
+    def _z_opponents_pvp(self, names):
+        """Motstandere i PvP uansett cfg z_target (treff-sjekken)."""
+        teams = {pe.get('name'): pe.get('team') for pe in (getattr(self, 'pvp_peers', ()) or ()) if isinstance(pe, dict)}
+        try:
+            mine = self._active_pvp_team()
+        except Exception:  # noqa: BLE001
+            mine = None
+        return {nm for nm in names if not (mine in ('Red', 'Blue') and teams.get(nm) == mine)}
+
+    def _coop_targets(self, p, now, entries, zone):
+        pad = self.pad
+        self._puppets_seen = (now, {e[0]: e[1] for e in entries if e[0] != self.name})   # v0.94.307: brukes av _pvp_swing
+        # v0.94.310: nettverksposisjonen (e[2]) er sann posisjon. Dukkens fysikk-kropp kunne stå fast et gammelt sted
+        # (GAMER2: Z-målet for Pat sto 5 min på samme punkt mens Pat gikk rundt).
+        net_pos = {}
+        for e in entries:
+            try:
+                q = e[2]
+                if e[0] != self.name and len(q) >= 3 and all(math.isfinite(float(v)) and abs(float(v)) < 1e5 for v in q[:3]):
+                    net_pos[e[0]] = (float(q[0]), float(q[1]), float(q[2]))
+            except (TypeError, ValueError, IndexError):
+                pass
+        self._puppets_pos = (now, net_pos)
+        st = self.__dict__.setdefault('_ztgt', {'zone': None})
+        if st.get('ok') is None:
+            st['ok'] = os.path.isfile(os.path.join(TUNIC_DIR, 'romfs', 'Pack', 'Actor', f'{self.ZTGT_ACTOR}.pack.zs'))
+            if not st['ok']:
+                log(f'z-mål: {self.ZTGT_ACTOR} finnes ikke i romfs (tools/target_pack.py) – Z-sikting på spillere av')
+        if not st['ok']:
+            return
+        if st.get('zone') != zone:
+            st.clear(); st.update(ok=True, zone=zone, free=[], owner={}, parked=set(), busy=False, spawn_t=0.0, spawns=0, known=None)
+        names = {e[0]: e[1] for e in entries if e[0] != self.name}
+        want = self._z_opponents(names)
+        if now - st.get('dbg_t', 0) > 30:
+            st['dbg_t'] = now
+            log(f"z-mål: zt={self.cfg.get('z_target')} modus={getattr(self, 'mode', None)} sone={zone} banc={pad.cur_banc} navn={list(names)} vil={sorted(want)} eiere={list(st['owner'])} "
+                f"ledige={len(st['free'])} kjent={None if st['known'] is None else len(st['known'])}")
+        if (not pad.cur_banc or now - getattr(pad, '_banc_since', now) < 12.0 or now < getattr(pad, '_tp_t', 0) + 8.0
+                or not pad._zone_ready(p, now)):
+            return
+        if st['known'] is None:   # mål fra forrige modd-start i samme spill/sone gjenbrukes
+            if pad.event_busy(p) is not None:
+                return
+            st['known'] = set()
+            for a0 in (pad._list_actors_raw(p, prefix=self.ZTGT_ACTOR) or {}):
+                x0 = pad.actor_x8(p, a0)
+                if x0 and pad.navi_ready(p, a0, x0):
+                    st['free'].append((a0, x0))
+                st['known'].add(a0)
+        for nm in list(st['owner']):
+            if nm not in want:
+                st['free'].append(st['owner'].pop(nm))
+        for nm in want:
+            if nm in st['owner']:
+                continue
+            if st['free']:
+                st['owner'][nm] = st['free'].pop()
+                continue
+            if st['busy'] or self.__dict__.get('_fairy', {}).get('busy') or self.__dict__.get('_glyph', {}).get('busy') \
+                    or st['spawns'] >= 8 or now - st['spawn_t'] < 1.5:
+                continue
+            try:
+                lp = p.f32(names[nm] + 0x31C, 3)
+            except OSError:
+                continue
+            st['busy'] = True; st['spawn_t'] = now; st['spawns'] += 1
+
+            def _spawn(pos=(lp[0], lp[1] - 3.0, lp[2])):
+                try:
+                    r = pad.create_actor(p, self.ZTGT_ACTOR, list(pos))
+                    if not r:
+                        st['ok'] = False
+                        log(f'z-mål: {self.ZTGT_ACTOR} kunne ikke lages – start spillet på nytt etter pakking')
+                        return
+                    time.sleep(1.0)
+                    mine = set(a for a, _ in st['owner'].values()) | {a for a, _ in st['free']}
+                    for a in (pad._list_actors_raw(p, prefix=self.ZTGT_ACTOR) or {}):
+                        if a in st['known'] or a in mine:
+                            continue
+                        st['known'].add(a)
+                        x8 = pad.actor_x8(p, a)
+                        if x8 and pad.navi_ready(p, a, x8):
+                            st['free'].append((a, x8))
+                    log(f'z-mål: laget {self.ZTGT_ACTOR} -> {r}')
+                except Exception as e:  # noqa: BLE001
+                    log(f'z-mål: spawn-feil {e!r}')
+                finally:
+                    st['busy'] = False
+            threading.Thread(target=_spawn, daemon=True, name='ZTargetSpawn').start()
+        pst = self.__dict__.setdefault('_glyph', {})
+        for nm, (a, x8) in list(st['owner'].items()):
+            if not pad.navi_ready(p, a, x8):   # død/ødelagt: glem den, ny lages
+                st['owner'].pop(nm); continue
+            lp = net_pos.get(nm) or (self._plate_pos(p, names[nm], pst) if nm in names else None)
+            if lp is None:
+                continue
+            goal = (lp[0], lp[1] + float(self.cfg.get('z_target_height', self.ZTGT_H)), lp[2])
+            self._fairy_move(p, a, x8, goal)
+            st['parked'].discard(a)
+            # v0.94.309: GAMER: Z-låsen satt under bakken. Logg hvor målet faktisk er (kropp og aktør) mot ønsket punkt.
+            if now - st.get('pos_t', 0) > 10:
+                st['pos_t'] = now
+                try:
+                    body = (p.f32(x8 + 0x1DC), p.f32(x8 + 0x1EC), p.f32(x8 + 0x1FC))
+                    ay = p.f32(a + 0x31C, 3)
+                    log(f"z-mål: {nm} mål 0x{a:X} ønsket y={goal[1]:.2f} kropp=({body[0]:.1f},{body[1]:.2f},{body[2]:.1f}) "
+                        f"aktør=({ay[0]:.1f},{ay[1]:.2f},{ay[2]:.1f}) kilde=({lp[0]:.1f},{lp[1]:.2f},{lp[2]:.1f}) "
+                        f"{'nett' if nm in net_pos else 'dukke'} dukke={self._plate_pos(p, names[nm], pst) if nm in names else None}")
+                except (OSError, TypeError):
+                    pass
+        for a, x8 in st['free']:   # ledige parkeres 6 m under bakken
+            if a not in st['parked'] and pad.navi_ready(p, a, x8):
+                try:
+                    lp = p.f32(a + 0x31C, 3)
+                    self._fairy_move(p, a, x8, (lp[0], lp[1] - 6.0, lp[2]))
+                    st['parked'].add(a)
+                except OSError:
+                    pass
+        if now - st.get('log_t', 0) > 30 and (st['owner'] or want):
+            st['log_t'] = now
+            log(f"z-mål: {', '.join(st['owner']) or '-'} (vil ha {', '.join(sorted(want)) or '-'}), ledige {len(st['free'])}, laget {st['spawns']}")
+
     def _coop_nameplates(self, p, now, entries, zone):
         pad = self.pad
         st = self.__dict__.setdefault('_glyph', {'zone': None})
@@ -6271,7 +6507,7 @@ class App:
             if lk in ('Red', 'Blue'):
                 self._pvp_team = lk
             log(f'utseende valgt: {lk}')
-            self._append_chat_sys(f'👕 {lk} lagret. Egen Link beholder oppstartsfargen til spillet startes på nytt.')
+            self._append_chat_sys(f'👕 {lk} lagret – tunikaen byttes om noen sekunder.')
 
     def _self_tunic_tick(self, now):
         """v0.94.257: overlayen fra v0.94.254 er av.
@@ -6501,6 +6737,10 @@ class App:
         if low == '/help' and not getattr(self, '_remote_run', False):
             self.chat_var.set(""); self._show_commands()   # v0.94.301: hosten ser bare sin egen liste
             return
+        if low.split()[0] in ('/drive', '/stick', '/btn', '/walkto'):   # v0.94.304: styr egen Link (bare fjernstyring, test)
+            self.chat_var.set("")
+            threading.Thread(target=self._drive_cmd, args=(low.split(),), daemon=True).start()
+            return
         if low.startswith('/rupees'):   # v0.94.301: bare fjernstyring (test) – f.eks. sette tilbake rupees etter test-spawn
             self.chat_var.set("")
             try:
@@ -6681,7 +6921,7 @@ class App:
                        "banc": self.pad.cur_banc, "force": True}
                 try:
                     self.gs.sendto(json.dumps(pkt).encode(), self.peer)
-                    fname = self.peer_name or "vennen"
+                    fname = getattr(self, "peer_name", None) or (self.friend or {}).get("name") or "vennen"
                     self._append_chat_sys(f"🌀 You teleported {fname} to you!")
                     log(f"chat kommando {low}: teleporterte {fname} til ({apos[0]:.2f}, {apos[1]:.2f}, {apos[2]:.2f})")
                 except OSError:
@@ -7334,10 +7574,12 @@ class App:
                 if stop.is_set() or not pose or mode != getattr(self, 'mode', 'Story'):
                     continue
                 if announce:
+                    # v0.94.320: ukjent lag i PvP (rett etter mod-omstart) sendes ikke – serveren nullstilte da laget
+                    tm = self._active_pvp_team() if mode == 'PvP' else None
+                    extra = {} if (mode == 'PvP' and tm is None) else {'team': tm}
                     self._server_cmd('hello', mode=mode,
-                                     team=self._active_pvp_team() if mode == 'PvP' else None,
                                      model=getattr(self, 'look', '') or '', color=self.hat_color,
-                                     **pose)
+                                     **extra, **pose)
                     last_hello = now
                 elif 'pos' in pose:
                     self._server_cmd('pose', mode=mode, **pose)
@@ -7423,6 +7665,7 @@ class App:
             prof = m.get('profile')
             if isinstance(prof, dict):
                 self._pvp_handle_profile(prof, old_prof)
+            self._apply_arena((m.get('lobby') or {}).get('arena'))
             selected_mode = (m.get('lobby') or {}).get('game_mode')
             if selected_mode in ('ctf', 'deathmatch') and selected_mode != self._game_mode:
                 self._game_mode = selected_mode
@@ -7491,6 +7734,15 @@ class App:
         self.cfg['game_mode_name'] = gm; self.cfg['game_mode_picked'] = True; save_cfg(self.cfg)
         self._game_mode_picked = True
         self.mode_pick.pack_forget(); self.mode_opts.pack(fill='x')
+        if hasattr(self, 'arena_row'):   # v0.94.320: brettvalg for begge; CTF viser bare CTF-brett
+            ctf = gm != 'Deathmatch'
+            for k_, rb_ in getattr(self, '_arena_radios', {}).items():
+                rb_.pack_forget()
+                if not ctf or self.ARENAS[k_].get('ctf'):
+                    rb_.pack(side='left', padx=4)
+            if ctf and not self.ARENAS.get(self.arena_var.get(), {}).get('ctf'):
+                self.arena_var.set('gohma')
+            self.arena_row.pack(fill='x', padx=10, pady=(2, 0), before=self.lobby_games)
         self._draw_lobby()
 
     def _unpick_game_mode(self):
@@ -7531,6 +7783,10 @@ class App:
         """Returner valgt serverlag (Red/Blue/None), ikke overskriv lagvalg ved periodisk hello."""
         if hasattr(self, '_pvp_team'):
             return self._pvp_team
+        # v0.94.320: etter mod-omstart – laget serveren har for meg (members)
+        for pe in ((getattr(self, '_server_state', None) or {}).get('members') or ()):
+            if isinstance(pe, dict) and pe.get('name') == getattr(self, 'name', None) and pe.get('team') in ('Red', 'Blue'):
+                return pe.get('team')
         lk = getattr(self, 'look', None)
         return lk if lk in ('Red', 'Blue') else None
 
@@ -7608,7 +7864,8 @@ class App:
                 self.mode_title.config(text=mode_name)
         want = 'deathmatch' if self.game_mode_var.get() == 'Deathmatch' else 'ctf'
         games = [g for g in (state.get('lobbies') or []) if g.get('id') != 0 and (g.get('id') == lobby.get('id') or g.get('game_mode', 'ctf') == want)]
-        items = [f"#{g.get('id')}  {'DM' if g.get('game_mode') == 'deathmatch' else 'CtF'}  {g.get('name')}  "
+        items = [f"#{g.get('id')}  {'DM' if g.get('game_mode') == 'deathmatch' else 'CtF'}"
+                 f"{ {'sword': '  Sword course', 'zora': "  Zora's Domain"}.get(g.get('arena'), '')}  {g.get('name')}  "
                  f"{g.get('players')}/{g.get('capacity')}  {'playing' if g.get('started') else 'open'}" for g in games]
         old_selection = self.lobby_games.curselection()
         if list(self.lobby_games.get(0, 'end')) != items:
@@ -7639,10 +7896,20 @@ class App:
         if not state.get('assets_match', True):
             diff = getattr(self, '_asset_diff', None) or {}
             cats = diff.get('cats') or []
+            # v0.94.304: hvem har andre filer enn meg (serveren sender hvert medlems hash) – vises før dere kobler til
+            my12 = (self.asset_hash or '')[:12]
+            odd_ = sorted(str(p.get('name')) for p in (members or ()) if isinstance(p, dict) and p.get('assets')
+                          and my12 and p.get('assets') != my12 and p.get('name') != self.name)
+            who_ = f" with {', '.join(odd_)}" if odd_ else ''
             if cats:
-                self.assets_info.config(text=f"Assets: MISMATCH – {', '.join(cats)} differ (se /assets / logg)", fg=WARN)
+                self.assets_info.config(text=f"Assets: MISMATCH{who_} – {', '.join(cats)} differ (se /assets / logg)", fg=WARN)
             else:
-                self.assets_info.config(text='Assets: MISMATCH – textures/models/patches differ (se /assets)', fg=WARN)
+                self.assets_info.config(text=f'Assets: MISMATCH{who_} – textures/models/patches differ (se /assets)', fg=WARN)
+            if odd_ and tuple(odd_) != getattr(self, '_odd_assets_shown', None):
+                self._odd_assets_shown = tuple(odd_)
+                self._append_chat_sys(f"⛔ {', '.join(odd_)} {'has' if len(odd_) == 1 else 'have'} different game files than you – "
+                                      f"you can't play together until everyone runs the same mod version.")
+                log(f'assets: lobbyen sier ulike filer hos {odd_} (min {my12})')
         elif self.asset_hash and members and all(p.get('assets') for p in members):
             self.assets_info.config(text=f'Assets: OK  ·  {self.asset_hash[:12]}', fg=OK)
         else:
@@ -7793,7 +8060,16 @@ class App:
                         }
                         if bones_b64:
                             pkt["bones"] = bones_b64
+                        # v0.94.304: spillet tegner ~30 bilder/s, vi sender 60/s – annenhver pakke var en kopi. Send bare når
+                        # noe har endret seg (ny spillramme, knapp, kamera, sone), ellers en livstegn-pakke hvert 0,25 s.
+                        sig_ = (pkt["apos"], pkt["arot"], pkt["cam_a"], pad_hex, pkt["banc"], bones_b64)
+                        if sig_ == getattr(self, '_fast_sig', None) and time.time() - getattr(self, '_fast_sent_t', 0) < 0.25:
+                            pkt = None
+                        else:
+                            self._fast_sig = sig_
                         try:
+                            if pkt is None:
+                                raise OSError('uendret')
                             _fp = json.dumps(pkt, separators=(',', ':')).encode(); self.gs.sendto(_fp, peer)
                             self._fast_sent_t = time.time(); perf_add('fast-B', len(_fp))   # v0.94.303: state-pakken trenger da ikke posisjon/bein
                         except OSError:
@@ -8609,7 +8885,7 @@ class App:
                         self._remote_run = False
                 self.ui(run)
 
-    INFO_CMDS = ('/zone', '/spawn', '/plates', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
+    INFO_CMDS = ('/zone', '/cfg', '/spawn', '/plates', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
 
     def _info_cmd(self, line):
         """Info-kommandoer (svar i chat og logg). Brukes også fra chatten."""
@@ -8667,6 +8943,18 @@ class App:
                             log(f'spawn-test: etter {t_:.0f}s finnes {len(f_)} {nm_}: {[(hex(k), [round(x, 1) for x in v[1]]) for k, v in f_.items()][:3]}')
                     threading.Thread(target=_sp, daemon=True).start()
                     out.append(f'spawn-test: lager {nm_}')
+            elif cmd == '/cfg':   # v0.94.307 test: /cfg <nøkkel> [verdi] – les/sett en innstilling (verdi som JSON, ellers tekst)
+                parts = line.split(None, 2)
+                if len(parts) < 2:
+                    out.append(f'bruk: /cfg <nøkkel> [verdi]  ({CFG})')
+                else:
+                    if len(parts) > 2:
+                        try:
+                            v_ = json.loads(parts[2])
+                        except ValueError:
+                            v_ = parts[2]
+                        self.cfg[parts[1]] = v_; save_cfg(self.cfg)
+                    out.append(f'cfg {parts[1]} = {self.cfg.get(parts[1])!r}  ({CFG})')
             elif cmd == '/blinkmode':   # /blinkmode 40 | all
                 self.pad.blink_mode = (line.split()[1] if len(line.split()) > 1 else 'all')
                 self.pad.__dict__.get('_pup_blink_addrs', {}).clear()
@@ -8826,20 +9114,28 @@ class App:
                 elif act == 'start':
                     self._pvp_manual_lobby_tok = None
                     self._server_cmd('start'); out.append('server: start forsøkt')
+                elif act == 'leave':   # v0.94.320: forlat lobbyen (samme som Leave-knappen)
+                    self._server_cmd('leave'); out.append('server: leave')
                 elif act == 'stop':
                     self._server_cmd('stop'); out.append('server: stop forsøkt')
                 elif act == 'create':
                     arg_sz = sub[1].lower() if len(sub) > 1 else '2v2'
                     sz = {'1v1': 2, '2': 2, '2v2': 4, '4': 4, '5v5': 10, '10': 10,
                           '10v10': 20, '20': 20, '25v25': 50, '50': 50}.get(arg_sz, 4)
-                    gm = 'deathmatch' if (len(sub) > 2 and sub[2] in ('dm', 'deathmatch')) else self._game_mode
-                    self._server_cmd('create', size=sz, game_mode=gm); out.append(f'server: create {sz} {gm}')
+                    gm = ('deathmatch' if (len(sub) > 2 and sub[2] in ('dm', 'deathmatch'))
+                          else 'ctf' if (len(sub) > 2 and sub[2] == 'ctf') else self._game_mode)
+                    # v0.94.316/320: brett – /match create 1v1 dm sword | 1v1 ctf zora | gohma (standard)
+                    ar = next((t.lower() for t in sub[2:] if t.lower() in self.ARENAS), 'gohma')
+                    if gm == 'ctf' and not self.ARENAS[ar].get('ctf'):
+                        out.append('Capture the flag finnes bare i: ' + ', '.join(k for k, v in self.ARENAS.items() if v.get('ctf')))
+                    else:
+                        self._server_cmd('create', size=sz, game_mode=gm, arena=ar); out.append(f'server: create {sz} {gm} {ar}')
                 elif act == 'join' and len(sub) > 1 and sub[1].isdigit():
                     self._server_cmd('join', lobby=int(sub[1])); out.append(f'server: join #{sub[1]}')
                 else:
                     st = getattr(self, '_server_state', None) or {}
                     lb = st.get('lobby') or {}
-                    out.append(f"server: lobby=#{lb.get('id')} mode={lb.get('game_mode')} host={lb.get('host')} started={lb.get('started')} score={st.get('score')} runde={st.get('round')}")
+                    out.append(f"server: lobby=#{lb.get('id')} mode={lb.get('game_mode')} arena={lb.get('arena')} host={lb.get('host')} started={lb.get('started')} score={st.get('score')} runde={st.get('round')}")
             elif cmd == '/bot':
                 out.append(self._bot_cmd(line.split()[1:]))
             elif cmd == '/status':
@@ -8894,6 +9190,90 @@ class App:
             return True
         except OSError:
             return False
+
+    # v0.94.304: testverktøy – styr EGEN Link via kontroller 2 (inp_v5: R+0xA00, gjelder x19 == [R+0x2B0]).
+    # Navn -> bits i den falske kontrolleren (fra RE-notater: B/sverd 0x10, hopp 0x08, slag 0x20); ellers hex.
+    DRIVE_BTN = {'sword': 0x10, 'b': 0x10, 'jump': 0x08, 'slash': 0x20, 'none': 0}
+
+    def _drive_set(self, on):
+        p, pad = self.p, self.pad
+        if not (p and pad.hR is not None and pad.player):
+            return False
+        if on:   # inp_v5 krever magi 0xB4E i R+0x280 også for kontroller 2 (modden setter den bare når Link 2-kopien finnes)
+            p.write(p.base + pad.hR + 0x280, struct.pack('<I', pad.MAGIC))
+        p.write(p.base + pad.hR + 0x2B0, struct.pack('<Q', pad.player if on else 0))
+        if not on:
+            self._bot_input()
+        return True
+
+    def _drive_cmd(self, a):
+        """/drive off | /stick sx sy sek [knapp] | /btn knapp [sek] | /walkto x z [maks_sek]   (stikke -1..1, y=fram)"""
+        p, pad = self.p, self.pad
+        out = []
+        try:
+            if not (p and self.ready and pad.hR is not None and pad.player):
+                out.append('drive: spillet er ikke klart'); return
+            if getattr(self, '_bot_owner', False):
+                out.append('drive: test-boten bruker kontroller 2'); return
+            cmd = a[0]
+            def btn_of(s_):
+                return self.DRIVE_BTN.get(s_, None) if s_ in self.DRIVE_BTN else int(s_, 16)
+            if cmd == '/drive':
+                self._drive_set(False); out.append('drive: av (vanlig kontroller)'); return
+            self._drive_busy = True
+            self._drive_set(True)
+            t0 = time.time(); start = pad.my_apos(p)
+            if cmd == '/stick':
+                sx, sy, secs = float(a[1]), float(a[2]), float(a[3]) if len(a) > 3 else 0.5
+                b_ = btn_of(a[4]) if len(a) > 4 else 0
+                while time.time() - t0 < secs:
+                    self._bot_input(b_, sx, sy); time.sleep(1 / 60)
+            elif cmd == '/btn':
+                b_ = btn_of(a[1]); secs = float(a[2]) if len(a) > 2 else 0.15
+                while time.time() - t0 < secs:
+                    self._bot_input(b_); time.sleep(1 / 60)
+                self._bot_input(); time.sleep(0.6)   # la animasjonen starte før kontroller 2 slippes
+            elif cmd == '/walkto':
+                tx, tz = float(a[1]), float(a[2]); lim = float(a[3]) if len(a) > 3 else 15.0
+                stuck_t, last = time.time(), None
+                while time.time() - t0 < lim:
+                    me = pad.my_apos(p)
+                    if not me:
+                        break
+                    dx, dz = tx - me[0], tz - me[2]; dist = math.hypot(dx, dz)
+                    if dist < 0.4:
+                        break
+                    if last and math.dist(me, last) > 0.05:
+                        stuck_t = time.time()
+                    last = me
+                    if time.time() - stuck_t > 1.5:   # står fast: hopp/rull
+                        self._bot_input(0x08); time.sleep(0.1); stuck_t = time.time()
+                    cam = pad.my_cam_angle(p, getattr(self, 'cam_off', None)) or 0.0
+                    ang = math.atan2(-dx, dz) - cam
+                    st_ = min(1.0, max(0.3, dist / 1.5))
+                    self._bot_input(0, -st_ * math.sin(ang), st_ * math.cos(ang)); time.sleep(1 / 60)
+            self._bot_input(); time.sleep(0.05)
+            self._drive_set(False)
+            end = pad.my_apos(p)
+            moved = math.dist(start, end) if start and end else -1
+            out.append(f"drive: {' '.join(a)} ferdig på {time.time() - t0:.1f} s, flyttet {moved:.2f} m, nå "
+                       f"{[round(v, 1) for v in end] if end else None}, anim {self._drive_anim()}")
+        except Exception as e:  # noqa: BLE001
+            out.append(f'drive: feil {e!r}')
+            try:
+                self._drive_set(False)
+            except Exception:  # noqa: BLE001
+                pass
+        finally:
+            self._drive_busy = False
+            for m in out:
+                log(m); self.ui(self._append_chat_sys, m)
+
+    def _drive_anim(self):
+        try:
+            return self.pad.read_anim(self.p, self.pad.p_act)[0]
+        except Exception:  # noqa: BLE001
+            return None
 
     def _bot_stop(self):
         self._bot_input()
@@ -9561,6 +9941,9 @@ class App:
         self._append_chat_sys(f'💥 You were knocked out! ({self._pvp_deaths})')
 
     PVP_SWING = ('Attack', 'Slash', 'Cut', 'Swing', 'Spin', 'Thrust', 'Stab', 'Atk', 'Sword')
+    PVP_SHOT = ('bowshoot', 'slingshot', 'pachinko')   # v0.94.308: sprettert bruker BowShoot (målt 10:22:41)
+    PVP_SHOT_RANGE = 15.0
+    PVP_SHOT_COS = 0.97   # ca. 14° fra Links retning
 
     def _pvp_swing(self, now):
         """Hver PC oppdager bare sine egne sverdtreff og sender dem i en egen PvP-teller.
@@ -9570,7 +9953,7 @@ class App:
             return
         lobby = (getattr(self, '_server_state', {}).get('lobby') or {})
         large_match = lobby.get('capacity') in (20, 50) and lobby.get('game_mode') == 'deathmatch'
-        if pad.p_act is None or (not large_match and pad.c_act is None):
+        if pad.p_act is None:
             return
         try:
             an = pad.read_anim(p, pad.p_act)[0]
@@ -9582,12 +9965,16 @@ class App:
             return
         if now - getattr(self, '_pvp_an_log', 0) > 0.5:
             self._pvp_an_log = now; log(f'pvp: min animasjon {prev} -> {an}')
-        if not any(k.lower() in an.lower() for k in self.PVP_SWING):
+        # v0.94.308: sprettert/bue (BowShoot) – før ble bare sverdslag sjekket, så skudd ga aldri treff.
+        shot = any(k in an.lower() for k in self.PVP_SHOT)
+        if not shot and not any(k.lower() in an.lower() for k in self.PVP_SWING):
             return
         me, rot = pad.my_apos(p), pad.my_arot(p)
         if not me or not rot:
             return
         spin = ('spin' in an.lower() or 'chargeattack' in an.lower())
+        if shot and large_match:
+            return   # serveren godtar bare swing/spin ennå (server.py record_hit)
         if large_match:
             match = lobby.get('started_at')
             team = self._active_pvp_team()
@@ -9617,32 +10004,94 @@ class App:
                     self._pvp_hit_last = now
                 break
             return
-        try:
-            l2 = p.f32(pad.c_act + 0x31C, 3)
-        except OSError:
-            return
+        # v0.94.307: motstanderen er en CoopPuppet (dukkepoolen), ikke den gamle Link 2 (c_act) – før ble ingen slag
+        # registrert i 1v1/små kamper fordi c_act alltid var None. Nærmeste motstander-dukke brukes (tegnet posisjon).
+        tgt_act, l2 = pad.c_act, None
+        if tgt_act is not None:
+            try:
+                l2 = p.f32(tgt_act + 0x31C, 3)
+            except OSError:
+                tgt_act = None
+        if l2 is None:
+            seen_t, pups = getattr(self, '_puppets_seen', (0, {}))
+            if now - seen_t > 1.0 or not pups:
+                return
+            opp = self._z_opponents_pvp(pups)
+            best = None
+            fx0, fz0 = rot[2], rot[8]
+            fn0 = math.hypot(fx0, fz0) or 1
+            for nm_, act_ in pups.items():
+                if nm_ not in opp:
+                    continue
+                pos_ = (getattr(self, '_puppets_pos', (0, {}))[1].get(nm_)
+                        or self._plate_pos(p, act_, self.__dict__.setdefault('_glyph', {})))   # v0.94.310: nettverksposisjon først
+                if pos_ is None:
+                    continue
+                dd = math.hypot(pos_[0] - me[0], pos_[2] - me[2])
+                if shot:   # skudd: den som står nærmest siktelinjen, ikke nærmest meg
+                    if dd > self.PVP_SHOT_RANGE or dd < 0.1:
+                        continue
+                    if ((pos_[0] - me[0]) * fx0 + (pos_[2] - me[2]) * fz0) / (dd * fn0) < self.PVP_SHOT_COS:
+                        continue
+                if best is None or dd < best[0]:
+                    best = (dd, act_, pos_)
+            if best is None:
+                return
+            _, tgt_act, l2 = best
         dx, dz = l2[0] - me[0], l2[2] - me[2]
         d = math.hypot(dx, dz)
-        if d > (2.4 if spin else 2.0) or abs(l2[1] - me[1]) > 1.5:
-            return
         fx, fz = rot[2], rot[8]   # forover = kolonne 2 (målt: 0,93 mot Link 2 som sto foran)
-        if not spin and d > 0.3 and (fx * dx + fz * dz) / (d * (math.hypot(fx, fz) or 1)) < 0.3:   # ikke foran meg
-            return
+        if shot:
+            # Ingen veggsjekk: skuddet treffer hvis motstanderen står innen PVP_SHOT_RANGE og nær siktelinjen
+            # (Z-lås snur Link mot målet). Høydeforskjell opp til 4 m (plattformer i arenaen).
+            if d > self.PVP_SHOT_RANGE or abs(l2[1] - me[1]) > 4.0 or d < 0.1:
+                return
+            if (fx * dx + fz * dz) / (d * (math.hypot(fx, fz) or 1)) < self.PVP_SHOT_COS:
+                return
+        else:
+            if d > (2.4 if spin else 2.0) or abs(l2[1] - me[1]) > 1.5:
+                return
+            if not spin and d > 0.3 and (fx * dx + fz * dz) / (d * (math.hypot(fx, fz) or 1)) < 0.3:   # ikke foran meg
+                return
         if now - getattr(self, '_pvp_hit_last', 0) < 0.45:
             return
         self._pvp_hit_last = now
-        dmg = 8 if spin else 4   # 3 hjerter i PvP; vanlig slag = 1 hjerte, spinn = 2.
+        dmg = 2 if shot else (8 if spin else 4)   # 3 hjerter i PvP; slag = 1 hjerte, spinn = 2, sprettert = ½.
         self._pvp_hit_total = getattr(self, '_pvp_hit_total', 0) + dmg
         log(f'pvp: TREFF på vennen med {an} ({d:.1f} m) -{dmg} kvartaler (PvP-sum {self._pvp_hit_total})')
         try:
             # Vis samme treff på angriperens Link 2. Mottakeren gjør dette også på sin ekte Link.
-            r = pad.hit_replay(p, pad.c_act, pad.p_act, dmg)
-            log(f'pvp: skadereaksjon på Link 2 (hit replay {r})')
+            r = pad.hit_replay(p, tgt_act, pad.p_act, dmg)
+            log(f'pvp: skadereaksjon på motstanderen (hit replay {r})')
             if not r:
-                pad.play_anim(p, pad.c_act, 'Damage')
+                pad.play_anim(p, tgt_act, 'Damage')
         except Exception as e:  # noqa: BLE001
             log(f'pvp: skadereaksjon på Link 2 feilet {e!r}')
 
+    # v0.94.316: brett (arena). Klasseverdiene under er Gohma-rommet; _apply_arena() overstyrer dem per instans når
+    # lobbyen (serverens «arena»-felt) eller /cfg pvp_arena velger et annet brett. CTF finnes bare i Gohma-rommet.
+    ARENAS = {
+        'gohma': {'name': 'Gohma-arenaen', 'banc': 'InsideTheDekuTree', 'start': 'Entrance',
+                  'positions': ([6.7, 48.0, 67.6], [7.7, 48.0, 66.6]), 'y': (40.0, 65.0), 'box': None, 'boss_door': True,
+                  'ctf': True, 'bases': {'Blue': [19.9, 47.0, 50.0], 'Red': [23.8, 47.0, 86.4]}},
+        # Sverd-banen i Kokiri-skogen (kula Obj_Kokiri_RollingRock_A_01 ved (-79.9, 120.7, 27.0); banen
+        # Land_Kokiri_RollingRockArea_* x -94..-78, z 17..47, gulv y≈118.6 – fra KokiriForest_Child_Dynamic.bcett).
+        'sword': {'name': 'Sverd-banen', 'banc': 'KokiriForest_Child', 'start': 'LostWoodBridge_FrontOfHyruleField',
+                  'positions': ([-79.0, 119.4, 18.0], [-86.5, 119.4, 45.5]), 'y': (112.0, 130.0),
+                  'box': (-104.0, -66.0, 6.0, 58.0), 'boss_door': False, 'rock': 'Obj_Kokiri_RollingRock_A_01'},
+        # v0.94.320: Zora's Domain (barn). Basene ved spillets egne ankomstpunkter (daurosk coop_start_points.inc):
+        # Rød ved inngangen fra Zora's River (4.5, 103.9, -37.0), Blå ved stien til Zora's Fountain (89.0, 119.4, 15.6).
+        # Lake Hylia-ankomst (3.3, 93.6, -3.7) er bunnen. Grenser: bare høyde inntil målt.
+        'zora': {'name': "Zora's Domain", 'banc': 'ZoraDomain_Child', 'start': 'ZoraDomain_FromZoraRiver',
+                 'positions': ([4.5, 104.4, -34.0], [86.0, 119.9, 15.6]), 'y': (80.0, 150.0), 'box': None,
+                 'boss_door': False, 'ctf': True,
+                 'bases': {'Red': [4.5, 104.4, -37.0], 'Blue': [89.0, 119.9, 15.6]},
+                 'team_spawn': {'Red': [4.5, 104.4, -34.0], 'Blue': [86.0, 119.9, 15.6]}},   # 3 m fra fakkelen (stod i den)
+    }
+    PVP_ARENA_Y = (40.0, 65.0)
+    PVP_ARENA_BOX = None
+    ROCK_SNAP = 3.0    # v0.94.319: kula hopper bare ved større avvik (m)
+    ROCK_PULL = 0.25   # ellers trekkes den denne brøkdelen mot vennens posisjon per tick
     PVP_BANC = 'InsideTheDekuTree'                       # CtF/DM-arena, aldri sosial lobby
     PVP_ARENA_START = 'Entrance'                         # vanlig inngang; bossrommet nås med intern teleport
     PVP_ARENA_POSITIONS = ([6.7, 48.0, 67.6], [7.7, 48.0, 66.6])
@@ -10128,13 +10577,22 @@ class App:
                 if not r or not self._pvp_wait_banc(self.PVP_BANC, generation):
                     log('pvp: arenaovergang avbrutt eller kunne ikke lastes')
                     return
+            ts = self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('team_spawn') or {}
+            if ts and self._game_mode == 'ctf':   # v0.94.320: rett etter mod-omstart er laget ukjent – vent inntil 10 s
+                t_end = time.time() + 10.0
+                while (self._active_pvp_team() not in ts and time.time() < t_end
+                       and generation == getattr(self, '_mode_generation', 0) and self.mode == 'PvP'):
+                    time.sleep(0.5)
             fs = (self.friend or {}).get('s') if self.friend else None
             slot = 1 if (fs is not None and fs < self.session) else 0
             pos = self.PVP_ARENA_POSITIONS[slot]
+            if ts and self._game_mode == 'ctf' and self._active_pvp_team() in ts:   # v0.94.320: CTF-start ved egen base
+                pos = ts[self._active_pvp_team()]
             # Marker _pvp_in_arena før teleport (pos x≈6.7/7.7 < 8.0) så _pvp_early_exit ikke kaster ut ved spawn.
             self._pvp_exit_armed = False
             self._pvp_exit_t = time.time()
             self._pvp_in_arena = True
+            self._pvp_lobby_done = True   # v0.94.320: ellers drar AutoLobby oss ut av arenaen etter mod-omstart
             r = pad.teleport_player(p, pos)
             self._pvp_spawn = list(pos)
             for i_ in (8595, 8594):
@@ -10146,7 +10604,20 @@ class App:
             self._pvp_set_hp(True)
             if self._game_mode == 'ctf':
                 self._ctf_setup()
-            log(f'pvp: i Gohma-arenaen ({self._game_mode}) plass {slot} -> {r}')
+            # v0.94.320: spillet kan sette Link tilbake til ankomstpunktet mens scenen ennå starter (sett i Zora's Domain:
+            # teleport til blå base 17:51:50, stod ved elveinngangen 17:52:27). Sjekk etter oppsettet og prøv igjen.
+            for _try in range(3):
+                if generation != getattr(self, '_mode_generation', 0) or self.mode != 'PvP' or not self._pvp_in_arena:
+                    break
+                while time.time() < getattr(pad, '_tp_t', 0) + CALL_TELEPORT_COOLDOWN:
+                    time.sleep(0.25)
+                me_ = pad.my_apos(p)
+                if not me_ or math.dist(me_, pos) <= 4.0:
+                    break
+                r = pad.teleport_player(p, pos)
+                log(f'pvp: stod {[round(v, 1) for v in me_]}, {math.dist(me_, pos):.0f} m fra startplassen – teleporterer igjen -> {r}')
+                time.sleep(2.0)
+            log(f"pvp: i {self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('name', 'arenaen')} ({self._game_mode}) plass {slot} -> {r}")
             self.ui(self._append_chat_sys, '⚔️ Match started – safe zone is disabled in the arena!')
         except Exception as e:  # noqa: BLE001
             import traceback
@@ -10281,7 +10752,7 @@ class App:
             current = {}
             self._ctf_lit = getattr(self, '_ctf_lit', {})
             me = pad.my_apos(p) if (p and getattr(self, 'ready', False)) else None
-            in_room10 = (me is None or me[1] < 70.0)
+            in_room10 = (me is None or self._ctf_in_room(me))
             for a, nm in allm.items():
                 if nm != 'Obj_CandleStick_NoGimmick_OnOff':
                     continue
@@ -10303,6 +10774,12 @@ class App:
             self._ctf_scan_t = time.time()
         finally:
             self._ctf_scan_busy = False
+
+    def _ctf_in_room(self, me):
+        """v0.94.320: er Link inne på CTF-brettet? Gohma: under inngangshallen (y<70). Andre brett: innenfor grensene."""
+        if getattr(self, '_arena_cur', 'gohma') == 'gohma':
+            return me[1] < 70.0
+        return not self._arena_outside(me)
 
     def _ctf_tick(self, now):
         if self.mode != 'PvP' or self._game_mode != 'ctf' or not getattr(self, '_pvp_in_arena', False):
@@ -10332,7 +10809,7 @@ class App:
         if tp_t and now < tp_t + CALL_TELEPORT_COOLDOWN:
             return
         me = self.pad.my_apos(self.p) if (self.p and getattr(self, 'ready', False)) else None
-        if me is not None and me[1] >= 70.0:   # Link er fortsatt i rom 0 (ankomst/bounceback) – ikke tell fakler
+        if me is not None and not self._ctf_in_room(me):   # Link er fortsatt i rom 0 (ankomst/bounceback) – ikke tell fakler
             return
         self._ctf_lit = getattr(self, '_ctf_lit', {})
         self._ctf_point_sent = getattr(self, '_ctf_point_sent', {})
@@ -10402,7 +10879,7 @@ class App:
                         if pad.cur_banc == banc and time.time() - getattr(pad, '_banc_since', 0) > 3.0:
                             break
                         time.sleep(0.25)
-            elif pad.cur_banc == self.PVP_BANC:
+            elif pad.cur_banc == self.PVP_BANC and getattr(self, '_arena_cur', 'gohma') == 'gohma':
                 me = pad.my_apos(p)
                 if me and math.dist(me, self.PVP_ARENA_POSITIONS[0]) <= 40:
                     safe_exit = [0.2, 101.5, 18.0]   # Deku-treet hovedhall (gulv y≈101.04, vekk fra SystemTextNPC ved døra)
@@ -10411,9 +10888,162 @@ class App:
         except Exception as e:  # noqa: BLE001
             log(f'pvp: lobby-feil {e!r}')
 
+    def _arena_key(self):
+        """v0.94.316: valgt brett – serverens lobby-felt først, ellers /cfg pvp_arena (lokal test), ellers Gohma."""
+        k = getattr(self, '_arena_from_server', None) or self.cfg.get('pvp_arena') or 'gohma'
+        if k not in self.ARENAS or (getattr(self, '_game_mode', 'ctf') == 'ctf' and not self.ARENAS[k].get('ctf')):
+            k = 'gohma'
+        return k
+
+    def _apply_arena(self, server_arena=None):
+        """Sett PVP_BANC/startplass/grenser for valgt brett (instansverdier skygger klasseverdiene)."""
+        if server_arena is not None:
+            self._arena_from_server = server_arena if server_arena in self.ARENAS else None
+        k = self._arena_key()
+        if getattr(self, '_arena_cur', 'gohma') == k and 'PVP_BANC' in self.__dict__:
+            return
+        a = self.ARENAS[k]
+        self.PVP_BANC, self.PVP_ARENA_START = a['banc'], a['start']
+        self.PVP_ARENA_POSITIONS = tuple(list(v) for v in a['positions'])
+        self.PVP_ARENA_Y, self.PVP_ARENA_BOX = a['y'], a['box']
+        self.PVP_BASES = {t: list(v) for t, v in (a.get('bases') or self.ARENAS['gohma']['bases']).items()}
+        if getattr(self, '_arena_cur', 'gohma') != k:
+            log(f"pvp: brett -> {a['name']} ({a['banc']})")
+            try:
+                self._append_chat_sys(f"🗺️ Arena: {a['name']}")
+            except Exception:  # noqa: BLE001
+                pass
+        self._arena_cur = k
+
+    def _rock_leader(self):
+        """Hvem styrer kula: spilleren med lavest sesjon (samme regel som startplass 0). Uten venn: meg."""
+        fs = (self.friend or {}).get('s') if self.friend else None
+        return not (fs is not None and fs < getattr(self, 'session', 0))
+
+    def _rock_tick(self, now):
+        """v0.94.316: sverd-banens rullende kule synket. Lederen sender kulas matrise + fart (state-feltet «rock»);
+        de andre skriver den (med fart-framskriving) inn i sin egen kule. Treff tas av hvert spill selv (livvakta i PvP
+        setter tilbake HP, så kula slår over ende uten å ta liv)."""
+        a = self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {})
+        name = a.get('rock')
+        p, pad = self.p, self.pad
+        if (not name or getattr(self, 'mode', 'Story') != 'PvP' or not getattr(self, '_pvp_in_arena', False) or not p
+                or pad.cur_banc != a.get('banc') or now - getattr(pad, '_banc_since', now) < 10.0
+                or now < getattr(pad, '_tp_t', 0) + 8.0):
+            self._my_rock = None
+            return
+        st = self.__dict__.setdefault('_rock', {})
+        zk = (id(p), pad.cur_banc, getattr(pad, '_banc_since', 0))
+        if st.get('zone') != zk:
+            st.clear(); st['zone'] = zk
+        if not st.get('act'):
+            if now - st.get('scan_t', 0) < 3.0:
+                return
+            st['scan_t'] = now
+            found = pad._list_actors_raw(p, prefix=name) or {}
+            for act in found:
+                x8 = pad.actor_x8(p, act)
+                if x8:
+                    st['act'], st['x8'] = act, x8
+                    log(f'kule: fant {name} @0x{act:X} pos {[round(v, 1) for v in found[act][1]]} – '
+                        f"{'jeg styrer den' if self._rock_leader() else 'følger vennens kule'}")
+                    break
+            if not st.get('act'):
+                return
+        act, x8 = st['act'], st['x8']
+        if not pad.actor_alive(p, act):
+            st.pop('act', None); return
+        h = p.base + x8 + 0x1D0
+        # v0.94.318: lederen må ha en kule som er på banen. Ligger egen kule utenfor (ødelagt), følg vennen – det reparerer
+        # den. Sender vennen ingen kule på 2 s (vennens er ødelagt), ta over.
+        mine = p.f32(act + 0x31C, 3)
+        ok_mine = bool(mine) and not self._arena_outside(mine)
+        fr0 = (self.friend or {}).get('rock')
+        if isinstance(fr0, list) and len(fr0) == 15:
+            st['fr_seen_t'] = now
+        lead = self._rock_leader()
+        if not ok_mine:
+            lead = False
+        elif not lead and now - st.get('fr_seen_t', now - 99) > 2.0:
+            lead = True
+        if lead != st.get('lead'):
+            st['lead'] = lead
+            log(f"kule: {'jeg styrer kula' if lead else 'følger vennens kule'} (egen kule {'på banen' if ok_mine else 'utenfor'}: "
+                f"{[round(v, 1) for v in mine] if mine else None})")
+        if lead:
+            # v0.94.318: aktørens egen posisjon/rotasjon (+0x31C/+0x328). Fysikk-kroppens matrise (x8+0x1D0) var tom
+            # for kula (0,0,0) – følgeren flyttet da sin kule til origo.
+            pos = p.f32(act + 0x31C, 3); r9 = p.f32(act + 0x328, 9)
+            if not pos or abs(pos[0]) + abs(pos[1]) + abs(pos[2]) < 1.0:
+                self._my_rock = None
+                return
+            m = (r9[0], r9[1], r9[2], pos[0], r9[3], r9[4], r9[5], pos[1], r9[6], r9[7], r9[8], pos[2])
+            prev = st.get('prev')
+            vel = ([(pos[i] - prev[1][i]) / (now - prev[0]) for i in range(3)]
+                   if prev and 0.01 < now - prev[0] < 0.5 else [0.0, 0.0, 0.0])
+            st['prev'] = (now, pos)
+            self._my_rock = [round(v, 3) for v in m] + [round(v, 2) for v in vel]
+            return
+        self._my_rock = None
+        fr = (self.friend or {}).get('rock')
+        if (not isinstance(fr, list) or len(fr) != 15 or now - getattr(self, 'friend_t', 0) > 1.0
+                or pad.friend_banc != pad.cur_banc):
+            if now - st.get('why_t', 0) > 15:
+                st['why_t'] = now
+                log(f"kule: følger ikke – vennens kule={type(fr).__name__}{'/' + str(len(fr)) if isinstance(fr, list) else ''} "
+                    f"alder={now - getattr(self, 'friend_t', 0):.1f}s sone venn={pad.friend_banc} meg={pad.cur_banc} "
+                    f"nøkler={sorted((self.friend or {}).keys())[:60]}")
+            return
+        dt = min(0.25, max(0.0, now - getattr(self, '_rock_rx_t', now)))
+        if fr is not st.get('last_fr'):
+            st['last_fr'] = fr; self._rock_rx_t = now; dt = 0.0
+        m = [float(v) for v in fr[:12]]
+        m[3] += fr[12] * dt; m[7] += fr[13] * dt; m[11] += fr[14] * dt
+        if not all(math.isfinite(v) and abs(v) < 1e5 for v in m) or abs(m[3]) + abs(m[7]) + abs(m[11]) < 1.0:
+            return
+        # v0.94.319: myk korreksjon. Egen kule fortsetter å rulle selv; vi trekker den en brøkdel mot vennens posisjon
+        # hvert tick i stedet for å hoppe dit (det hakket når kulene kom ut av takt). Bare stort avvik (>ROCK_SNAP m) hopper.
+        cur = struct.unpack('<3f', p.read(p.base + act + 0x31C, 12))
+        err = (m[3] - cur[0], m[7] - cur[1], m[11] - cur[2])
+        d = math.sqrt(err[0] ** 2 + err[1] ** 2 + err[2] ** 2)
+        snap = d > self.ROCK_SNAP
+        if d < 0.03:
+            pass
+        elif snap:
+            st['snaps'] = st.get('snaps', 0) + 1
+            body = struct.unpack('<12f', p.read(h, 48))
+            if abs(body[3]) + abs(body[7]) + abs(body[11]) > 1.0:   # bare hvis kroppen faktisk bærer posisjonen
+                p.write(h, struct.pack('<12f', *m))
+                w = struct.unpack('<I', p.read(p.base + x8 + 0x228, 4))[0]
+                p.write(p.base + x8 + 0x228, struct.pack('<I', w | 7))
+            p.write(p.base + act + 0x31C, struct.pack('<3f', m[3], m[7], m[11]))
+            p.write(p.base + act + 0x328, struct.pack('<9f', m[0], m[1], m[2], m[4], m[5], m[6], m[8], m[9], m[10]))
+        else:
+            k = self.ROCK_PULL
+            p.write(p.base + act + 0x31C, struct.pack('<3f', cur[0] + err[0] * k, cur[1] + err[1] * k, cur[2] + err[2] * k))
+        st['err_max'] = max(st.get('err_max', 0.0), d)
+        if now - st.get('log_t', 0) > 30:
+            st['log_t'] = now
+            mine = struct.unpack('<3f', p.read(p.base + act + 0x31C, 12))
+            log(f'kule: følger vennens kule ({m[3]:.1f}, {m[7]:.1f}, {m[11]:.1f}), egen nå {[round(v, 1) for v in mine]}'
+                f" – største avvik {st.get('err_max', 0.0):.2f} m, hopp {st.get('snaps', 0)} siste 30 s")
+            st['err_max'] = 0.0; st['snaps'] = 0
+
+    def _arena_outside(self, me):
+        """Utenfor brettets grenser (høyde, og for sverd-banen et x/z-rektangel)?"""
+        y0, y1 = getattr(self, 'PVP_ARENA_Y', (40.0, 65.0))
+        if not y0 < me[1] < y1:
+            return True
+        box = getattr(self, 'PVP_ARENA_BOX', None)
+        return bool(box) and not (box[0] < me[0] < box[1] and box[2] < me[2] < box[3])
+
     def _pvp_early_exit(self, now):
         """Ta PvP-spilleren ut før native bossdør kan vise «Cannot exit right now».
         Utgangen armes først inne i rommet slik at arena-spawn ved x≈7 ikke utløser den."""
+        # v0.94.315: av som standard. Den kastet spilleren ut ved døra og gjeninngangen hentet ham rett inn igjen (sett 14:33).
+        # «Cannot exit»-meldingen kommer ikke lenger: SystemTextNPC fjernes i PvP-arenaen. Slå på med /cfg pvp_early_exit true.
+        if not self.cfg.get('pvp_early_exit', False) or getattr(self, '_arena_cur', 'gohma') != 'gohma':
+            return False
         if (getattr(self, '_pvp_travel_busy', False)
                 or getattr(self.pad, 'cur_banc', None) != self.PVP_BANC
                 or now - getattr(self, '_pvp_exit_t', 0) <= 5.0):
@@ -10471,6 +11101,11 @@ class App:
             pass
         if self._game_mode == 'ctf':
             self._ctf_tick(now)
+        try:
+            self._rock_tick(now)
+        except Exception as e:  # noqa: BLE001
+            if now - getattr(self, '_rock_err_t', 0) > 10:
+                self._rock_err_t = now; log(f'kule: feil {e!r}')
         if now - getattr(self, '_pvp_hit_t', 0) > 0.1:
             self._pvp_hit_t = now
             self._pvp_early_exit(now)
@@ -10506,7 +11141,8 @@ class App:
                     if getattr(pd, 'h_bools', None) is None:
                         pd.read_bools(self.p)   # v0.90: flagg-ticken er av i PvP – finn tabellen her
                     if getattr(pd, 'h_bools', None) is not None:
-                        for i in (8595, 8594) + tuple(self.cfg.get('pvp_flags', [10771, 11111, 11139, 10848])):   # v0.94.23: dør + valgbare boss-flagg (finn hvilket som gir «Cannot exit»)
+                        for i in ((8595, 8594) + tuple(self.cfg.get('pvp_flags', [10771, 11111, 11139, 10848]))
+                                  if self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('boss_door', True) else ()):   # v0.94.23: dør + valgbare boss-flagg (finn hvilket som gir «Cannot exit»)
                             b = self.p.read(self.p.base + pd.h_bools + i * 0x18 + 0x16, 1)
                             if b and b[0]:
                                 pd.clear_bool(self.p, i)
@@ -10527,7 +11163,7 @@ class App:
                 log(f'pvp: utenfor Bombchu safe zone {[round(v, 1) for v in me_]} – tilbake -> {pad.teleport_player(p, sp)}')
         if getattr(self, '_pvp_in_arena', False) and pad.cur_banc == self.PVP_BANC:
             me_ = pad.my_apos(p)
-            if me_ and not 40 < me_[1] < 65:
+            if me_ and self._arena_outside(me_):
                 sp = getattr(self, '_pvp_spawn', None)
                 if sp and now - getattr(self, '_pvp_back_t', 0) > 3.0 and now - getattr(pad, '_tp_t', 0) > 3.0:
                     self._pvp_back_t = now
@@ -11516,12 +12152,30 @@ class App:
                 # The native damage record is applied after the HP write,
                 # so server damage uses only the cosmetic reaction.
                 r = False if from_server else self.pad.hit_replay(
-                    self.p, self.pad.p_act, self.pad.c_act, max(1, amt), heavy=ko)
+                    self.p, self.pad.p_act, self.pad.c_act or self._nearest_opp_puppet(), max(1, amt), heavy=ko)
                 # Skriving i Life-komponenten betyr ikke at spillerens HP faktisk endret seg.
                 # HP er derfor alltid autoritativ her, også når hit replay returnerer True.
-                self.p.write(self.p.base + pc, struct.pack("<I", target))
+                # v0.94.307: hit replay legger også inn spillets egen skade (trekkes i Life-steget etter skrivingen) –
+                # før ble skaden trukket to ganger (HP 4 -> 0, livvakta reddet). Når replay virket: skriv target + amt,
+                # så spillets eget trekk lander på target; etter 0,5 s rettes HP til target hvis spillet ikke trakk.
+                self.p.write(self.p.base + pc, struct.pack("<I", target + amt if r else target))
                 hp_written = True
                 self._pvp_hp_shadow = target
+                if r:
+                    proc_, pc_t = self.p, pc
+
+                    def _settle(proc_=proc_, pc_t=pc_t, target=target):
+                        try:
+                            if self.p is proc_:
+                                now_hp = struct.unpack("<I", proc_.read(proc_.base + pc_t, 4))[0]
+                                if now_hp != target:
+                                    proc_.write(proc_.base + pc_t, struct.pack("<I", target))
+                                    log(f'skade: spillet trakk ikke selv ({now_hp}) – HP satt til {target}')
+                                    # v0.94.309: spillet tok ikke treffet -> ingen egen reaksjon; vis i det minste skade-animasjonen
+                                    self.ui(lambda: self.pad.play_anim(self.p, self.pad.p_act, 'Damage'))
+                        except Exception:  # noqa: BLE001
+                            pass
+                    threading.Timer(0.5, _settle).start()
                 log(f"skade: PvP-treff -{dmg} kvartaler ({hp} -> {target}){' – SLÅTT NED' if ko else ''} (hit replay {r})")
                 if ko:
                     self._pvp_down_until = time.time() + 5.0
@@ -12193,6 +12847,11 @@ class App:
                 except Exception as e_f:  # noqa: BLE001
                     if now - getattr(self, '_fairy_err_t', 0) > 10:
                         self._fairy_err_t = now; log(f'fe: feil {e_f!r}')
+                try:   # v0.94.307: Z-sikte-mål på motstanderne
+                    self._coop_targets(p, now, active_entries, zone)
+                except Exception as e_t:  # noqa: BLE001
+                    if now - getattr(self, '_ztgt_err_t', 0) > 10:
+                        self._ztgt_err_t = now; log(f'z-mål: feil {e_t!r}')
                 try:   # v0.94.291: navneskilt over dukkene
                     self._coop_nameplates(p, now, active_entries, zone)
                 except Exception as e_g:  # noqa: BLE001
@@ -12439,6 +13098,8 @@ class App:
             self._puppet_gear_pend = {}
             self._puppet_followers = {}       # v0.94.160: ny sone = nye CoopFollow-jegere
             self._puppet_spawn_fails = 0      # v0.94.153: ny sone = ny opprettelses teller
+            self._puppet_unconfirmed = {}     # v0.94.314: ny sone = nye forsøk
+            self._puppet_unc_logged = set()
             pad.__dict__.get('_bones_cache', {}).clear()
         if (not zone or now - getattr(pad, '_banc_since', now) < 3
                 or now < getattr(pad, '_tp_t', 0) + CALL_TELEPORT_COOLDOWN):
@@ -12451,7 +13112,7 @@ class App:
             if found is not None:
                 self._puppet_actors = pool = {actor: data[0] for actor, data in found.items()}
                 if pending:
-                    model, previous_actors, _ = pending
+                    model, previous_actors = pending[0], pending[1]
                     if any(pool[actor] == model for actor in pool.keys() - previous_actors):
                         self._puppet_pending_spawn = None
                         self._puppet_spawn_t = now
@@ -12506,17 +13167,37 @@ class App:
             return
         if len(pool) < pad.PUPPET_MAX:
             unconfirmed = self._puppet_pending_spawn
+            # v0.94.311: vent på at forrige dukke av samme modell dukker opp (maks 10 s) før en ny lages. Før ventet bare
+            # Hyrule Field; ellers ble en ny laget etter 3 s og begge ble stående (ekstra Link på GAMER ved fargebytte).
+            if (zone != 'HyruleField_Child' and unconfirmed and unconfirmed[0] == missing[0] and len(unconfirmed) > 3
+                    and now - unconfirmed[3] < 10.0):   # Hyrule Field: prøver reservepunktet (bro) etter vanlig ventetid
+                return
             self._puppet_pending_spawn = None
             model, spawn_pos = missing
+            # v0.94.314: GAMER2 fant ikke de nye dukkene i aktørlista (levende=0) og laget en ny hvert 10. s – hver ble stående
+            # som en ekstra Link. Maks 2 ubekreftede per modell og sone; deretter ingen nye før sonebytte.
+            unc = self.__dict__.setdefault('_puppet_unconfirmed', {})
+            ukey = (zone, model)
+            if any(m_ == model for m_ in pool.values()):
+                unc.pop(ukey, None)
+            elif unc.get(ukey, 0) >= 2:
+                if not self.__dict__.setdefault('_puppet_unc_logged', set()) & {ukey}:
+                    self._puppet_unc_logged.add(ukey)
+                    log(f'dukkepool: {model} laget {unc[ukey]} ganger i {zone} uten å dukke opp i aktørlista – lager ikke flere her '
+                        f'(liste: {getattr(pad, "_list_why", "-")}, lengde {getattr(pad, "_list_len", "-")})')
+                return
             # The bridge entrance previously materialized 49 puppets. Alternate
             # to it if a request at the peer's position didn't materialize.
             fallback = (198.18, 163.38, 309.63)
-            alternate = unconfirmed and unconfirmed[0] == model and unconfirmed[2] != fallback
+            alternate = (zone == 'HyruleField_Child' and unconfirmed and unconfirmed[0] == model
+                         and unconfirmed[2] != fallback)
             if alternate:
                 spawn_pos = fallback
             result = pad.create_actor(p, model, spawn_pos)
-            if result and zone == 'HyruleField_Child':
-                self._puppet_pending_spawn = (model, pool.keys(), spawn_pos)
+            if result and zone != 'HyruleField_Child':
+                unc[ukey] = unc.get(ukey, 0) + 1
+            if result:
+                self._puppet_pending_spawn = (model, set(pool.keys()), spawn_pos, now)
             # v0.94.153: begrens opprettelsesløkka. Uten bekreftelse blir hvert
             # opprettelseskall et tregt spillkall (flere sekunder), og modden henger
             # (nett-tikken falt til 0.3/s). Nå går vi 3 s -> 10 s -> 30 s -> 60 s.
@@ -13137,6 +13818,7 @@ class App:
                    "rb": getattr(self, '_rb_ver', 0),
                    "l2d": getattr(self.pad, 'l2_dmg_total', 0),
                    "pvph": getattr(self, '_pvp_hit_total', 0),
+                   "rock": getattr(self, '_my_rock', None),   # v0.94.316: sverd-banens kule (leder -> følger)
                    "tk": [h for h, t in getattr(self, '_en_claims', {}).items() if t > time.time()][:24],
                    "it": getattr(self, '_my_item', None),
                    "dr": getattr(self, '_my_drawn', None),
@@ -13192,10 +13874,30 @@ class App:
 
     # ------------------------------------------------------------ hovedløkke
     def _tick(self):
+        try:
+            self._tick_body()
+        except Exception as e:  # noqa: BLE001 – hovedløkka skal aldri dø
+            if time.time() - getattr(self, '_tick_err_t', 0) > 10:
+                self._tick_err_t = time.time()
+                log(f'hovedløkke-feil: {e!r}\n{traceback.format_exc()}')
+            self.root.after(33, self._tick)
+
+    def _tick_body(self):
         while not self.ui_q.empty():
-            fn, a = self.ui_q.get_nowait(); fn(*a)
+            fn, a = self.ui_q.get_nowait()
+            try:   # v0.94.307: en feil i en UI-jobb (f.eks. /here uten venn) stoppet hele hovedløkka for godt
+                fn(*a)
+            except Exception as e:  # noqa: BLE001
+                log(f'ui-jobb feilet: {e!r}\n{traceback.format_exc()}')
         _t0 = time.perf_counter()
-        me, alive = self._net_tick()
+        try:
+            me, alive = self._net_tick()
+        except Exception as e:  # noqa: BLE001
+            if time.time() - getattr(self, '_net_tick_err_t', 0) > 10:
+                self._net_tick_err_t = time.time()
+                log(f'nett-tick feilet: {e!r}\n{traceback.format_exc()}')
+            self.root.after(33, self._tick)
+            return
         perf_add('nett-tick', time.perf_counter() - _t0)
         try:
           if 'figure' not in SKIP:
@@ -13422,6 +14124,8 @@ def main():
     except (AttributeError, OSError):
         pass
     root = tk.Tk()
+    # v0.94.307: Tk-feil gikk til stderr (finnes ikke i exe-en) – nå til loggen
+    root.report_callback_exception = lambda et, ev, tb: log('tk-feil: ' + ''.join(traceback.format_exception(et, ev, tb)))
     try:
         _app = App(root)
         def _close():

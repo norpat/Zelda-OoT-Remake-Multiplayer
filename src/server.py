@@ -56,6 +56,9 @@ def udp_state_packet(state, pose_v2):
     return encode(dict(state, peers=peers))
 
 
+ARENAS = ("gohma", "sword", "zora")
+CTF_ARENAS = ("gohma", "zora")   # 2026-11-23: CTF-brett   # 2026-11-23: PvP-brett (se ARENAS i oot_mp_gui.py)
+
 class ZeldaServer:
     def __init__(self, db_path="stats.db"):
         self.lock = threading.RLock()
@@ -123,9 +126,10 @@ class ZeldaServer:
         return self._weather_cur
 
     @staticmethod
-    def new_lobby(lobby_id, name, capacity, host, game_mode="ctf"):
+    def new_lobby(lobby_id, name, capacity, host, game_mode="ctf", arena="gohma"):
         return {"id": lobby_id, "name": name, "capacity": capacity, "host": host,
                 "game_mode": game_mode if game_mode in ("ctf", "deathmatch", "story") else "ctf",
+                "arena": arena if arena in ARENAS else "gohma",   # 2026-11-23: brett (gohma = Deku-treets bossrom, sword = sverd-banen)
                 "score": {"Red": 0, "Blue": 0}, "round": 1, "target": 5,
                 "started": False, "started_at": None, "created": time.time()}
 
@@ -468,14 +472,20 @@ class ZeldaServer:
         elif kind == "create":
             capacity = {2: 2, 4: 4, 10: 10, 20: 20, 50: 50}.get(message.get("size"))
             game_mode = message.get("game_mode", "ctf")
+            arena = message.get("arena") or "gohma"
             if capacity is None:
                 error = "Velg 1v1, 2v2, 5v5, 10v10 eller 25v25"
             elif game_mode not in ("ctf", "deathmatch"):
                 error = "Ukjent spilltype"
+            elif arena not in ARENAS:
+                error = "Ukjent brett"
+            elif game_mode == "ctf" and arena not in CTF_ARENAS:
+                error = "Capture the flag finnes bare i Gohma-rommet og Zora's Domain"
             else:
                 lobby_id = self.next_lobby
                 self.next_lobby += 1
-                lobby = self.new_lobby(lobby_id, f"Game {lobby_id} ({capacity // 2}v{capacity // 2})", capacity, name, game_mode)
+                lobby = self.new_lobby(lobby_id, f"Game {lobby_id} ({capacity // 2}v{capacity // 2})", capacity, name, game_mode,
+                                       arena)
                 self.lobbies[lobby_id] = lobby
                 player.update(lobby=lobby_id, ready=False)
                 self.event(name, "create", message, now)
@@ -531,6 +541,8 @@ class ZeldaServer:
                 error = "Spilltypen kan ikke endres under en kamp"
             elif game_mode not in ("ctf", "deathmatch"):
                 error = "Ukjent spilltype"
+            elif game_mode == "ctf" and lobby.get("arena", "gohma") not in CTF_ARENAS:
+                error = "Capture the flag finnes bare i Gohma-rommet og Zora's Domain"
             else:
                 lobby["game_mode"] = game_mode
                 for member in self.members(lobby["id"], now).values():
@@ -666,7 +678,8 @@ class ZeldaServer:
             if count or item["id"] == player["lobby"] or item.get("game_mode") == "story":
                 summaries.append({"id": item["id"], "name": item["name"], "players": count,
                                   "capacity": item["capacity"], "started": item["started"], "host": item["host"],
-                                  "game_mode": item["game_mode"], "protected": bool(item.get("password"))})
+                                  "game_mode": item["game_mode"], "arena": item.get("arena", "gohma"),
+                                  "protected": bool(item.get("password"))})
         asset_hashes = {p.get("assets") for p in self.members(lobby["id"], now).values() if p.get("assets")}
         same_channel = lambda p: (p.get("present") and p.get("mode", "PvP") == player.get("mode", "PvP")
                                   and (player.get("mode") != "Story" or p.get("lobby") == player.get("lobby")))
@@ -685,7 +698,7 @@ class ZeldaServer:
                 "assets_match": len(asset_hashes) < 2,
                 "lobby": {"id": lobby["id"], "name": lobby["name"], "host": lobby["host"],
                           "capacity": lobby["capacity"], "started": lobby["started"], "started_at": lobby["started_at"],
-                          "elapsed": elapsed, "game_mode": lobby["game_mode"]},
+                          "elapsed": elapsed, "game_mode": lobby["game_mode"], "arena": lobby.get("arena", "gohma")},
                 "lobbies": summaries, "profile": None if player.get("_auth") == "denied" else self.get_profile(name), "shop": SHOP_CATALOG,
                 "account": player.get("_auth"), "acct_msg": (player.get("_acct_msg") or (None, 0))[0] if now - (player.get("_acct_msg") or (None, 0))[1] < 3 else None,
                 "online": [{"name": n, "lobby": p["lobby"]} for n, p in self.players.items()

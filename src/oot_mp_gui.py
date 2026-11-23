@@ -10086,7 +10086,11 @@ class App:
                  'positions': ([4.5, 104.4, -34.0], [86.0, 119.9, 15.6]), 'y': (80.0, 150.0), 'box': None,
                  'boss_door': False, 'ctf': True,
                  'bases': {'Red': [4.5, 104.4, -37.0], 'Blue': [89.0, 119.9, 15.6]},
-                 'team_spawn': {'Red': [4.5, 104.4, -34.0], 'Blue': [86.0, 119.9, 15.6]}},   # 3 m fra fakkelen (stod i den)
+                 'team_spawn': {'Red': [4.5, 104.4, -34.0], 'Blue': [86.0, 119.9, 15.6]},   # 3 m fra fakkelen (stod i den)
+                 # v0.94.320: facklene sto over bakken. Fot = gulv (StartPos-y fra ZoraDomain_Child_Static.bcett) - 0.5;
+                 # midtfakkelen mellom spillets to fakkelstativer på plassen (36.1, 114.4, 12.7 / 18.6) i stedet for
+                 # midtpunktet (over bassenget). Lyssøyle over hver base så man ser hvor man skal.
+                 'torch_y': {'Red': 103.4, 'Blue': 118.9}, 'mid': [36.1, 114.4, 15.6], 'base_pillars': True},
     }
     PVP_ARENA_Y = (40.0, 65.0)
     PVP_ARENA_BOX = None
@@ -10695,10 +10699,19 @@ class App:
             time.sleep(0.5)
             b, r = self.PVP_BASES['Blue'], self.PVP_BASES['Red']
             out = []
-            c = [(b[0] + r[0]) / 2, b[1], (b[2] + r[2]) / 2]
-            for nm, pos, sc in (('Obj_CandleStick_NoGimmick_OnOff', [b[0], b[1] - 0.5, b[2]], 1.0), ('Obj_CandleStick_NoGimmick_OnOff', [r[0], r[1] - 0.5, r[2]], 1.0),
-                                ('Obj_FireTemple_CandleStick_A_01', [c[0], c[1] - 1.3, c[2]], 1.0),
-                                ('EftLoc_SageRoom_LightPillar_00', list(c), 1.0)):
+            ar_ = self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {})
+            ty = ar_.get('torch_y') or {}
+            c = list(ar_.get('mid') or [(b[0] + r[0]) / 2, b[1], (b[2] + r[2]) / 2])
+            plan = [('Obj_CandleStick_NoGimmick_OnOff', [b[0], ty.get('Blue', b[1] - 0.5), b[2]], 1.0),
+                    ('Obj_CandleStick_NoGimmick_OnOff', [r[0], ty.get('Red', r[1] - 0.5), r[2]], 1.0),
+                    ('Obj_FireTemple_CandleStick_A_01', [c[0], c[1] - (1.3 if not ar_.get('mid') else 0.8), c[2]], 1.0),
+                    ('EftLoc_SageRoom_LightPillar_00', list(c), 1.0)]
+            if ar_.get('base_pillars'):   # v0.94.320: synlig søyle + lagfarget lys over hver base
+                for tm_, bp_ in (('Blue', b), ('Red', r)):
+                    plan.append(('EftLoc_SageRoom_LightPillar_00', [bp_[0], bp_[1] - 0.5, bp_[2]], 1.0))
+                    if self.CTF_SCORE_EFFECT.get(tm_):
+                        plan.append((self.CTF_SCORE_EFFECT[tm_], [bp_[0], bp_[1] + 2.0, bp_[2]], 1.0))
+            for nm, pos, sc in plan:
                 if cancelled():
                     log('ctf: oppsett avbrutt før ny aktør')
                     return

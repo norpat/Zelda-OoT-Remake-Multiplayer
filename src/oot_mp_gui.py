@@ -47,7 +47,7 @@ except ImportError:
         Gdb = None
 
 
-VERSION = "0.94.320"
+VERSION = "0.94.322"
 
 
 def puppet_low_hp_pulse(now):
@@ -5419,9 +5419,10 @@ class App:
             self.pad.romfs_look = self.look
         log(f'tunika: oppstartsfarge i romfs = {self.pad.romfs_look}')
         self.pad.link2_actor = self.cfg.get('link2_actor') or 'Player_Child'
-        cb_look = ttk.Combobox(top_in, textvariable=self.look_var, values=LOOKS, width=11, state="readonly")
+        cb_look = self.cb_look = ttk.Combobox(top_in, textvariable=self.look_var, values=LOOKS, width=11, state="readonly")
         cb_look.pack(side="left", padx=(6, 0))
         cb_look.bind("<<ComboboxSelected>>", lambda _e: self._save_look())
+        self.root.after(3000, self._pvp_look_loop)   # v0.94.321: PvP-tunika = lagfarge
         # v0.73: Story / PvP
         tk.Label(top_in, text="Mode", bg=PANEL, fg=MUTED, font=("Segoe UI", 9)).pack(side="left", padx=(10, 0))
         self.mode = self.cfg.get("mode") if self.cfg.get("mode") in MODES else "Story"
@@ -5610,7 +5611,7 @@ class App:
         self.arena_row = tk.Frame(self.mode_opts, bg=PANEL)
         tk.Label(self.arena_row, text='Arena:', bg=PANEL, fg=MUTED, font=('Segoe UI', 9)).pack(side='left')
         self._arena_radios = {}
-        for _k, _lbl in (('gohma', 'Gohma room'), ('sword', 'Sword course (rolling boulder)'), ('zora', "Zora's Domain")):
+        for _k, _lbl in (('gohma', 'Gohma room'), ('sword', 'Sword course (rolling boulder)'), ('zora', "Zora's Domain"), ('field', 'Hyrule Field (night)')):
             self._arena_radios[_k] = tk.Radiobutton(self.arena_row, text=_lbl, value=_k, variable=self.arena_var, bg=PANEL, fg=FG, selectcolor=FIELD,
                            activebackground=PANEL, activeforeground=GOLD, font=('Segoe UI', 9),
                            command=lambda: (self.cfg.__setitem__('arena_pick', self.arena_var.get()), save_cfg(self.cfg))
@@ -6381,6 +6382,7 @@ class App:
             self._ctf_reset_at = 0   # En planlagt CtF-runde skal aldri starte etter retur til Story.
             self._pvp_spawn = None; self._pvp_on_since = time.time()
             log(f'modus valgt: {md}')
+            self._pvp_look_tick()
             if md == 'PvP':   # v0.79: FOLLOW bare i Story
                 self.follow_cb.pack_forget()   # v0.94.295: NAMES blir stående (navneskilt i lagfarge i PvP)
                 self._pvp_lobby_done = False
@@ -6500,8 +6502,49 @@ class App:
         if getattr(self, 'mode', 'Story') == 'Story':   # hent på nytt med nøkkelen
             self._sinv_loaded = False; self._inv_load_pending = time.time(); self._server_cmd('inv_get', key=key)
 
+    PVP_LOOKS = ('Blue', 'Red')   # v0.94.321: i PvP kan man bare være blå eller rød (= laget); andre farger kun i Story
+
+    def _pvp_look_tick(self):
+        """PvP: tunikaen følger laget (Blue/Red). Story: tilbake til lagret farge. Lagret Story-farge (cfg) røres ikke."""
+        story = self.cfg.get('look') if self.cfg.get('look') in LOOKS else 'Red'
+        if getattr(self, 'mode', 'Story') == 'PvP':
+            tm = getattr(self, '_pvp_team', None)
+            if tm not in self.PVP_LOOKS:
+                for pe in ((getattr(self, '_server_state', None) or {}).get('members') or ()):
+                    if isinstance(pe, dict) and pe.get('name') == getattr(self, 'name', None) and pe.get('team') in self.PVP_LOOKS:
+                        tm = pe.get('team')
+            want = tm if tm in self.PVP_LOOKS else (self.look if self.look in self.PVP_LOOKS else
+                                                   (story if story in self.PVP_LOOKS else 'Blue'))
+            vals = list(self.PVP_LOOKS)
+        else:
+            want, vals = story, list(LOOKS)
+        cb = getattr(self, 'cb_look', None)
+        if cb is not None and list(cb.cget('values')) != vals:
+            cb.config(values=vals)
+        if self.look != want:
+            log(f"tunika: {'PvP-lag' if vals != list(LOOKS) else 'Story'} -> {want} (var {self.look})")
+            self.look = want; self.pad.my_look = want
+            if self.look_var.get() != want:
+                self.look_var.set(want)
+
+    def _pvp_look_loop(self):
+        try:
+            self._pvp_look_tick()
+        except Exception as e:  # noqa: BLE001
+            log(f'tunika: lagfarge-feil {e!r}')
+        self.root.after(1000, self._pvp_look_loop)
+
     def _save_look(self):
         lk = self.look_var.get()
+        if getattr(self, 'mode', 'Story') == 'PvP':
+            # v0.94.321: i PvP er fargen = laget; valget bytter lag, Story-fargen beholdes
+            if lk in self.PVP_LOOKS:
+                self._select_team(lk)
+                self._append_chat_sys(f'👕 Team {lk} – the tunic changes in a few seconds.')
+                self._pvp_look_tick()
+            else:
+                self.look_var.set(self.look)
+            return
         if lk in LOOKS:
             self.look = lk; self.cfg['look'] = lk; save_cfg(self.cfg); self.pad.my_look = lk
             if lk in ('Red', 'Blue'):
@@ -7787,7 +7830,7 @@ class App:
         for pe in ((getattr(self, '_server_state', None) or {}).get('members') or ()):
             if isinstance(pe, dict) and pe.get('name') == getattr(self, 'name', None) and pe.get('team') in ('Red', 'Blue'):
                 return pe.get('team')
-        lk = getattr(self, 'look', None)
+        lk = (getattr(self, 'cfg', None) or {}).get('look')
         return lk if lk in ('Red', 'Blue') else None
 
     def _select_team(self, team):
@@ -7865,7 +7908,7 @@ class App:
         want = 'deathmatch' if self.game_mode_var.get() == 'Deathmatch' else 'ctf'
         games = [g for g in (state.get('lobbies') or []) if g.get('id') != 0 and (g.get('id') == lobby.get('id') or g.get('game_mode', 'ctf') == want)]
         items = [f"#{g.get('id')}  {'DM' if g.get('game_mode') == 'deathmatch' else 'CtF'}"
-                 f"{ {'sword': '  Sword course', 'zora': "  Zora's Domain"}.get(g.get('arena'), '')}  {g.get('name')}  "
+                 f"{ {'sword': '  Sword course', 'zora': "  Zora's Domain", 'field': '  Hyrule Field'}.get(g.get('arena'), '')}  {g.get('name')}  "
                  f"{g.get('players')}/{g.get('capacity')}  {'playing' if g.get('started') else 'open'}" for g in games]
         old_selection = self.lobby_games.curselection()
         if list(self.lobby_games.get(0, 'end')) != items:
@@ -8885,7 +8928,7 @@ class App:
                         self._remote_run = False
                 self.ui(run)
 
-    INFO_CMDS = ('/zone', '/cfg', '/spawn', '/plates', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/help')
+    INFO_CMDS = ('/zone', '/cfg', '/spawn', '/plates', '/blinkmode', '/paint', '/skip', '/status', '/enemies', '/boss', '/flags', '/items', '/ping', '/bot', '/ctf', '/arena', '/lobby', '/match', '/team', '/inv', '/buy', '/bgm', '/assets', '/pvpflags', '/pvpfilter', '/torches', '/tp', '/memsnap', '/actors', '/help')
 
     def _info_cmd(self, line):
         """Info-kommandoer (svar i chat og logg). Brukes også fra chatten."""
@@ -8978,6 +9021,62 @@ class App:
                     out.append(f'pvp-meldingssperre: aktiv={bool(fl)} (R+0xEF8={fl}), blokkerte={hits} (R+0xEFC)')
                 else:
                     out.append('pvp-meldingssperre: ingen R funnet ennå')
+            elif cmd == '/tp':   # v0.94.322 test: /tp x y z – teleporter egen Link, logger landingspunkt etter 3 s
+                parts = line.split()
+                try:
+                    pos_ = [float(v) for v in parts[1:4]]
+                    assert len(pos_) == 3
+                except Exception:  # noqa: BLE001
+                    out.append('bruk: /tp x y z')
+                else:
+                    r_ = self.pad.teleport_player(self.p, pos_)
+                    def _landed(pos_=pos_):
+                        time.sleep(3.0)
+                        log(f'tp: {pos_} -> landet {[round(v, 2) for v in (self.pad.my_apos(self.p) or [])]}')
+                    threading.Thread(target=_landed, daemon=True).start()
+                    out.append(f'tp: {pos_} -> {r_}')
+            elif cmd == '/actors':   # v0.94.322 test: /actors [filter] – antall levende aktører per navn (logges)
+                parts = line.split(); flt = parts[1].lower() if len(parts) > 1 else ''
+                allm = {}; self.pad._scan_full_t = 0
+                found = self.pad._scan_actors_raw(self.p, allm) or {}
+                allm.update({a_: v_[0] for a_, v_ in found.items()})
+                cnt = {}
+                for a_, nm_ in allm.items():
+                    if flt in nm_.lower():
+                        cnt[nm_] = cnt.get(nm_, 0) + 1
+                log(f'actors ({len(allm)} totalt, filter {flt!r}): ' + ', '.join(f'{k}×{v}' for k, v in sorted(cnt.items())))
+                me_ = self.pad.my_apos(self.p); near = []
+                for a_, nm_ in allm.items():
+                    try:
+                        q_ = self.p.f32(a_ + 0x31C, 3); near.append((math.dist(q_, me_), nm_))
+                    except Exception:  # noqa: BLE001
+                        pass
+                log('actors nærmest: ' + ', '.join(f'{n_} {d_:.1f}m' for d_, n_ in sorted(near)[:25]))
+                out.append(f'actors: {len(cnt)} navn (se logg)')
+            elif cmd == '/memsnap':   # v0.94.322 test: /memsnap <sek> – lagrer Link- og Weapon_DekuStick-minne hvert 0.2 s (logs/memsnap.bin)
+                parts = line.split(); secs_ = float(parts[1]) if len(parts) > 1 else 10.0
+                def _snap(secs_=secs_):
+                    pad_, p_ = self.pad, self.p
+                    allm = {}; pad_._scan_full_t = 0
+                    pad_._scan_actors_raw(p_, allm)
+                    sticks = [a for a, nm in allm.items() if nm == 'Weapon_DekuStick']
+                    regs = [('link', pad_.p_act)] + [(f'stick{i}', a) for i, a in enumerate(sticks)]
+                    log(f'memsnap: {[(n, hex(a)) for n, a in regs]} i {secs_} s')
+                    import pickle
+                    frames = []; t0 = time.time()
+                    while time.time() - t0 < secs_:
+                        fr = {'t': time.time() - t0}
+                        for n, a in regs:
+                            try:
+                                fr[n] = p_.read(p_.base + a, 0x4000)
+                            except OSError:
+                                fr[n] = None
+                        frames.append(fr); time.sleep(0.2)
+                    with open(os.path.join(APP_DIR, 'logs', 'memsnap.bin'), 'wb') as fh:
+                        pickle.dump({'regs': regs, 'frames': frames}, fh)
+                    log(f'memsnap: {len(frames)} bilder lagret')
+                threading.Thread(target=_snap, daemon=True).start()
+                out.append(f'memsnap: {secs_} s')
             elif cmd == '/torches':
                 torches = getattr(self, '_ctf_actors', {}) or {}
                 lit = getattr(self, '_ctf_lit', {}) or {}
@@ -9096,9 +9195,11 @@ class App:
                             tr = tok
                     self.cfg['pvp_lobby_bgm'] = tr
                     self.cfg['pvp_lobby_bgm_vol'] = vol
+                    self.cfg['pvp_jukebox_arena'] = True
                     save_cfg(self.cfg)
                     self._pvp_lobby_bgm_applied = None
-                    if getattr(self, 'mode', 'Story') == 'PvP' and p and self.ready and pad.cur_banc == self.PVP_LOBBY_BANC:
+                    if getattr(self, 'mode', 'Story') == 'PvP' and p and self.ready and (
+                            pad.cur_banc == self.PVP_LOBBY_BANC or self._pvp_jukebox_in_arena(True)):
                         self._pvp_sync_lobby_bgm(now=now, force=True)
                     if hasattr(self, '_jukebox_refresh'):
                         self._jukebox_refresh()
@@ -10091,6 +10192,21 @@ class App:
                  # midtfakkelen mellom spillets to fakkelstativer på plassen (36.1, 114.4, 12.7 / 18.6) i stedet for
                  # midtpunktet (over bassenget). Lyssøyle over hver base så man ser hvor man skal.
                  'torch_y': {'Red': 103.4, 'Blue': 118.9}, 'mid': [36.1, 114.4, 15.6], 'base_pillars': True},
+        # v0.94.322: Hyrule Field om natten (brukerønske): Rød ved Gerudo Valley-inngangen, Blå ved Kakariko-trappa
+        # (spillets ankomstpunkter, daurosk coop_start_points.inc) – ca. 500 m mellom basene. Ingen NPC-er/fiender
+        # (clear_radius dekker hele feltet), klokka holdes på natt, lyssøyler viser vei.
+        'field': {'name': 'Hyrule Field (night)', 'banc': 'HyruleField_Child', 'start': 'HyruleField_FrontOfGerudoValley',
+                  'positions': ([-291.0, 138.6, 165.8], [121.5, 153.4, 39.6]), 'y': (100.0, 230.0), 'box': None,
+                  'boss_door': False, 'ctf': True,
+                  # v0.94.322: gulv målt med /tp (landingspunkt); base-y = gulv + 0.5 som i Zora, fakkelfot = gulv - 0.5
+                  'bases': {'Red': [-294.1, 138.6, 166.7], 'Blue': [124.3, 153.4, 38.6]},   # Blå 70 m fra uglen ved Kakariko
+                  'team_spawn': {'Red': [-291.0, 138.6, 165.8], 'Blue': [121.5, 153.4, 39.6]},
+                  'torch_y': {'Red': 137.6, 'Blue': 152.4},
+                  'mid': [-53.1, 148.6, 90.5], 'base_pillars': True, 'night': 0, 'clear_radius': 700.0, 'no_stalchild': 60.0,
+                  # lyssøyler (ikke flammer) ~45 m fra hverandre langs ruta Rød–Blå (målte gulvpunkter + 0.5)
+                  'route': [[-252.2, 141.7, 161.4], [-202.5, 142.2, 149.1], [-161.2, 142.8, 127.5], [-119.1, 152.0, 112.0],
+                            [-74.7, 149.3, 97.9], [-31.0, 149.2, 84.1], [13.1, 149.4, 71.2], [57.0, 151.4, 57.5],
+                            [101.0, 154.7, 46.8]]},
     }
     PVP_ARENA_Y = (40.0, 65.0)
     PVP_ARENA_BOX = None
@@ -10162,10 +10278,12 @@ class App:
             self._jukebox_last_vol = vol
         self.cfg['pvp_lobby_bgm'] = track_id
         self.cfg['pvp_lobby_bgm_vol'] = vol
+        self.cfg['pvp_jukebox_arena'] = True   # v0.94.321: brukt jukeboks -> gjelder også i arenaene
         save_cfg(self.cfg)
         self._pvp_lobby_bgm_applied = None
         self._jukebox_refresh()
-        if getattr(self, 'mode', 'Story') == 'PvP' and self.p and getattr(self, 'ready', False) and getattr(self.pad, 'cur_banc', None) == self.PVP_LOBBY_BANC:
+        if getattr(self, 'mode', 'Story') == 'PvP' and self.p and getattr(self, 'ready', False) and (
+                getattr(self.pad, 'cur_banc', None) == self.PVP_LOBBY_BANC or self._pvp_jukebox_in_arena(True)):
             self._pvp_sync_lobby_bgm(force=True, async_worker=True)
 
     def _jukebox_step(self, delta):
@@ -10248,6 +10366,16 @@ class App:
         if self.p and self.ready:
             self.pad.restore_lobby_bgm(self.p, restart_market=restart_market)
 
+    def _pvp_jukebox_in_arena(self, force=False):
+        """True når jukebox-valget skal spilles i arenaen (PvP, inne i arenaen, jukeboxen brukt)."""
+        pad = self.pad
+        return bool(getattr(self, 'mode', 'Story') == 'PvP'
+                    and self.p and getattr(self, 'ready', False)
+                    and getattr(self, '_pvp_in_arena', False)
+                    and (getattr(self, 'cfg', None) or {}).get('pvp_jukebox_arena')
+                    and getattr(pad, 'cur_banc', None) == self.PVP_BANC
+                    and (force or not getattr(self, '_pvp_travel_busy', False)))
+
     def _pvp_sync_lobby_bgm(self, now=None, force=False, async_worker=False):
         """Bytt musikk i Bombchu-lobbyen til dempet BGM_Drugstore (kun i PvP)."""
         if now is None:
@@ -10261,6 +10389,10 @@ class App:
                     and not getattr(self, '_pvp_in_arena', False)
                     and (force or (not getattr(self, '_pvp_travel_busy', False)
                                    and (not lobby_st.get('started') or tok == getattr(self, '_pvp_manual_lobby_tok', None)))))
+        # v0.94.321: jukeboxen gjelder også i arenaen, men først etter at spilleren selv har brukt den
+        # (ellers beholder arenaen sin egen musikk).
+        if not in_lobby:
+            in_lobby = self._pvp_jukebox_in_arena(force)
         if not in_lobby:
             self._pvp_restore_lobby_bgm(
                 restart_market=(getattr(self, 'mode', 'Story') == 'Story' and getattr(pad, 'cur_banc', None) == self.PVP_LOBBY_BANC),
@@ -10581,6 +10713,8 @@ class App:
                 if not r or not self._pvp_wait_banc(self.PVP_BANC, generation):
                     log('pvp: arenaovergang avbrutt eller kunne ikke lastes')
                     return
+            if self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('clear_radius', 0) > 200:
+                self._pvp_preclear(generation)   # v0.94.322: hele feltet tømt før spillerne flyttes til basene
             ts = self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('team_spawn') or {}
             if ts and self._game_mode == 'ctf':   # v0.94.320: rett etter mod-omstart er laget ukjent – vent inntil 10 s
                 t_end = time.time() + 10.0
@@ -10621,6 +10755,8 @@ class App:
                 r = pad.teleport_player(p, pos)
                 log(f'pvp: stod {[round(v, 1) for v in me_]}, {math.dist(me_, pos):.0f} m fra startplassen – teleporterer igjen -> {r}')
                 time.sleep(2.0)
+            if self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('clear_radius', 0) > 200:
+                self._pvp_preclear(generation)   # det som ble lastet inn ved basen
             log(f"pvp: i {self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('name', 'arenaen')} ({self._game_mode}) plass {slot} -> {r}")
             self.ui(self._append_chat_sys, '⚔️ Match started – safe zone is disabled in the arena!')
         except Exception as e:  # noqa: BLE001
@@ -10629,6 +10765,52 @@ class App:
         finally:
             self.pad.suppress_link2 = False
             self._pvp_travel_busy = False
+
+    PVP_PRECLEAR_TRIG = ('EventRequestActor', 'EventProxyRequestActor', 'Dm_Locator', 'SystemTextNPC')
+
+    def _pvp_bury(self, p, a, nm):
+        """v0.94.322: fiende som ikke kan slettes (Enemy_Guay_Fixed, Peahat-larve): flytt 500 m ned og deaktiver."""
+        try:
+            pos = p.f32(a + 0x31C, 3)
+            if pos[1] < -200:
+                return True
+            p.write(p.base + a + 0x31C, struct.pack('<3f', pos[0], pos[1] - 500.0, pos[2]))
+            p.write(p.base + a + 0x2C, struct.pack('<I', 5))
+            log(f'pvp: {nm} kunne ikke slettes – flyttet under bakken')
+            return True
+        except OSError:
+            return False
+
+    def _pvp_preclear(self, generation):
+        """v0.94.322: store brett (Hyrule Field): slett alle NPC-er, fiender og hendelsesutløsere i hele scenen
+        før spillerne teleporteres til basene (uglen ved Kakariko startet samtale ved blå base)."""
+        p, pad = self.p, self.pad
+        t0 = time.time(); n = 0; fail = 0
+        while time.time() < getattr(pad, '_tp_t', 0) + CALL_TELEPORT_COOLDOWN:
+            if generation != getattr(self, '_mode_generation', 0) or self.mode != 'PvP':
+                return
+            time.sleep(0.25)
+        gone = self.__dict__.setdefault('_pvp_gone', set())
+        bad, badn = set(), set()
+        for _round in range(3):
+            allm = {}; pad._scan_full_t = 0
+            found = pad._scan_actors_raw(p, allm) or {}
+            allm.update({a_: v_[0] for a_, v_ in found.items()})
+            todo = [(a, nm) for a, nm in sorted(allm.items()) if a not in bad
+                    and ((nm.startswith(('Npc_', 'Enemy_')) and nm != 'Npc_Navi') or nm in self.PVP_PRECLEAR_TRIG)]
+            if not todo:
+                break
+            for a, nm in todo:
+                if generation != getattr(self, '_mode_generation', 0) or self.mode != 'PvP':
+                    return
+                r = pad.delete_actor(p, a)
+                if r:
+                    gone.add(a); n += 1
+                else:
+                    fail += 1; bad.add(a); badn.add(nm)
+                    if nm.startswith('Enemy_') and self._pvp_bury(p, a, nm):
+                        gone.add(a)
+        log(f'pvp: forhåndsrydding av {pad.cur_banc}: {n} NPC/fiender/utløsere fjernet, {fail} feilet {sorted(badn)}, {time.time() - t0:.1f} s')
 
     # Capture the Flame: fakkelstolper ved basene og tent fakkel/lyssøyle i midten.
     # Obj_BlueFire/Obj_FireTemple_Fire beholdes KUN i oppryddingen etter v0.94.43.
@@ -10688,7 +10870,10 @@ class App:
                     except OSError:
                         continue
                     mid = [(self.PVP_BASES['Blue'][k] + self.PVP_BASES['Red'][k]) / 2 for k in range(3)]
-                    if any(math.dist(q, b) < (10.0 if nm.startswith('EftLoc') else 4.0) for b in list(self.PVP_BASES.values()) + [mid]):
+                    spots_ = list(self.PVP_BASES.values()) + [mid] + [list(v) for v in (self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('route') or ())]
+                    # v0.94.322: på lange brett (route) finnes ingen egne CTF-gjenstander – fjern alle (gamle fakler i lufta)
+                    if (self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('route')
+                            or any(math.dist(q, b) < (10.0 if nm.startswith('EftLoc') else 4.0) for b in spots_)):
                         if not wait_cooldown():
                             return
                         # Én kort forespørsel: fem lange forsøk per aktør blokkerte modusbyttet.
@@ -10706,6 +10891,11 @@ class App:
                     ('Obj_CandleStick_NoGimmick_OnOff', [r[0], ty.get('Red', r[1] - 0.5), r[2]], 1.0),
                     ('Obj_FireTemple_CandleStick_A_01', [c[0], c[1] - (1.3 if not ar_.get('mid') else 0.8), c[2]], 1.0),
                     ('EftLoc_SageRoom_LightPillar_00', list(c), 1.0)]
+            for pt_ in (ar_.get('route') or ()):   # v0.94.322: lys som viser vei – ikke flammer (ellers kan man tenne pinnen underveis)
+                plan.append(('EftLoc_SageRoom_LightPillar_00', [pt_[0], pt_[1] - 0.5, pt_[2]], 1.0))
+            if ar_.get('no_stalchild'):   # v0.94.322: spillets egen «ingen Stalchild her»-sone over hele ruta (forsøk)
+                for pt_ in [b, r, c] + [list(v) for v in (ar_.get('route') or ())]:
+                    plan.append(('ForbidStalchildDivingArea', [pt_[0], pt_[1], pt_[2]], float(ar_['no_stalchild'])))
             if ar_.get('base_pillars'):   # v0.94.320: synlig søyle + lagfarget lys over hver base
                 for tm_, bp_ in (('Blue', b), ('Red', r)):
                     plan.append(('EftLoc_SageRoom_LightPillar_00', [bp_[0], bp_[1] - 0.5, bp_[2]], 1.0))
@@ -10728,6 +10918,7 @@ class App:
             if cancelled():
                 return
             log(f'ctf: basefakler og midtfakkel opprettet -> {out}')
+            self._ctf_banc_t = getattr(pad, '_banc_since', 0)   # v0.94.322: ny scenelasting (Game Over) -> sett opp på nytt
             self._ctf_find_torches()
         except Exception as e:  # noqa: BLE001
             log(f'ctf: feil {e!r}')
@@ -10794,7 +10985,30 @@ class App:
             return me[1] < 70.0
         return not self._arena_outside(me)
 
+    def _stal_follow(self, now):
+        """v0.94.322: flytt en av spillets egne ForbidStalchildDivingArea-soner til Links posisjon (Stalchild dukker
+        ikke opp inne i slike soner). Adressene fornyes av aktørryddingen hvert 1.5 s."""
+        areas = getattr(self, '_stal_areas', None)
+        if (not areas or self.mode != 'PvP' or not getattr(self, '_pvp_in_arena', False)
+                or now - getattr(self, '_stal_t', 0) < 0.2 or now < getattr(self.pad, '_tp_t', 0) + 2.0):
+            return
+        self._stal_t = now
+        try:
+            me = self.pad.my_apos(self.p)
+            if not me:
+                return
+            for a in areas[:2]:
+                if self.pad.actor_alive(self.p, a):
+                    self.p.write(self.p.base + a + 0x31C, struct.pack('<3f', me[0], me[1], me[2]))
+            if now - getattr(self, '_stal_log_t', 0) > 60:
+                self._stal_log_t = now
+                log(f'stalchild: {min(2, len(areas))} av {len(areas)} sperresoner følger Link {[round(v, 1) for v in me]}')
+        except OSError:
+            pass
+
     def _ctf_tick(self, now):
+        if (getattr(self, 'cfg', None) or {}).get('stal_follow') and self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('no_stalchild'):
+            self._stal_follow(now)   # v0.94.322: testet 10:53–10:58 – hjalp ikke (Stalchild kom likevel); av som standard
         if self.mode != 'PvP' or self._game_mode != 'ctf' or not getattr(self, '_pvp_in_arena', False):
             self._ctf_reset_at = 0
             return
@@ -10804,6 +11018,14 @@ class App:
             self._ctf_actors = {}; self._ctf_lit = {}; self._ctf_friend_lit = {}; self._ctf_point_sent = {}
             return
         if getattr(self, '_ctf_busy', False):
+            return
+        bt_ = getattr(self.pad, '_banc_since', 0)
+        if (getattr(self, '_ctf_banc_t', None) is not None and bt_ and bt_ != self._ctf_banc_t
+                and now - bt_ > 8.0 and not getattr(self, '_pvp_travel_busy', False)):
+            # v0.94.322: Game Over lastet arenaen på nytt i samme sone – alle fakler/lys var borte
+            log('ctf: arenaen ble lastet på nytt (Game Over?) – setter opp fakler og lys igjen')
+            self._ctf_banc_t = None
+            threading.Thread(target=self._ctf_setup, daemon=True).start()
             return
         if getattr(self, '_ctf_reset_at', 0) and now >= self._ctf_reset_at:
             self._ctf_reset_at = 0
@@ -11198,9 +11420,17 @@ class App:
         except OSError:
             pass
         in_lobby = bool(getattr(self, '_pvp_social_lobby', False) and pad.cur_banc == self.PVP_LOBBY_BANC)
+        if getattr(self, '_pvp_scan_busy', False) and now - getattr(self, '_pvp_scan_t', 0) > 25.0:
+            log('pvp: aktørrydding hang i over 25 s – starter på nytt'); self._pvp_scan_busy = False
+        if getattr(self, '_pvp_in_arena', False) and now - getattr(self, '_pvp_scan_why_t', 0) > 30 and now - getattr(self, '_pvp_scan_t', 0) > 20:
+            self._pvp_scan_why_t = now
+            log(f"pvp: aktørrydding venter – banc={pad.cur_banc}/{self.PVP_BANC} me={bool(me)} spawning={getattr(pad, '_spawning', False)} "
+                f"tun={getattr(pad, '_tun_busy', False)} busy={getattr(self, '_pvp_scan_busy', False)} "
+                f"banc_age={now - getattr(pad, '_banc_since', 0):.0f} tp_age={now - getattr(pad, '_tp_t', 0):.0f}")
         if (((getattr(self, '_pvp_in_arena', False) and pad.cur_banc == self.PVP_BANC) or in_lobby)
-                and now - getattr(self, '_pvp_scan_t', 0) > 5.0 and me
+                and now - getattr(self, '_pvp_scan_t', 0) > (1.5 if (not in_lobby and self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('clear_radius', 0) > 200) else 5.0) and me
                 and not getattr(pad, '_spawning', False) and not getattr(pad, '_tun_busy', False)
+                and not getattr(self, '_pvp_scan_busy', False)
                 and now - getattr(pad, '_banc_since', 0) > 10.0 and now - getattr(pad, '_tp_t', 0) > 8.0):
             self._pvp_scan_t = now
             def run():
@@ -11215,6 +11445,9 @@ class App:
                     allm = {}; pad._scan_full_t = 0
                     found = pad._scan_actors_raw(p, allm) or {}
                     allm.update({a_: v_[0] for a_, v_ in found.items()})   # Enemy_* kommer i returverdien, Npc_* i _diag_all
+                    if not in_lobby and self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('no_stalchild'):
+                        # v0.94.322: spillets egne «ingen Stalchild»-soner – én følger Link (se _stal_follow)
+                        self._stal_areas = sorted(a_ for a_, n_ in allm.items() if n_ == 'ForbidStalchildDivingArea')
                     gone = self.__dict__.setdefault('_pvp_gone', set())
                     if False and in_lobby and self.PVP_VENDOR not in allm.values() and time.time() - getattr(self, '_vendor_try', 0) > 20:   # av: tegnes ikke
                         self._vendor_try = time.time()
@@ -11226,7 +11459,7 @@ class App:
                             log('pvp: aktørrydding avbrutt ved modusbytte')
                             return
                         trig = nm in ('Area', 'EventRequestActor', 'Dm_Locator', 'Obj_WarpPoint_A_01', 'Obj_Heart_Container', 'SystemTextNPC')   # v0.94.30: cutscene-triggere og bossrester
-                        if not (nm.startswith('Enemy_') or nm.startswith('Npc_') or trig) or nm == 'Npc_Navi' or a in gone:
+                        if not (nm.startswith('Enemy_') or nm.startswith('Npc_') or trig) or nm == 'Npc_Navi' or (a in gone and not nm.startswith('Enemy_')):   # v0.94.322: ny fiende kan få samme adresse (Stalchild)
                             continue
                         if in_lobby and not nm.startswith('Npc_'):
                             continue
@@ -11251,18 +11484,25 @@ class App:
                             pass
                         try:
                             pos = p.f32(a + 0x31C, 3)
-                            if math.dist(pos, me) > (400 if in_lobby else 120):   # lobby = hele byen
+                            if math.dist(pos, me) > (400 if in_lobby else self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('clear_radius', 120)):   # lobby = hele byen
                                 continue
                         except OSError:
                             continue
                         gone.add(a)
                         r = pad.delete_actor(p, a)
+                        if not r:   # v0.94.322: mislykket sletting (f.eks. Peahat-larve -> 0) – prøv igjen neste runde
+                            gone.discard(a)
+                            if nm.startswith('Enemy_') and self._pvp_bury(p, a, nm):
+                                gone.add(a)
                         log(f'pvp: fjernet {nm} -> {r}')
                         n += 1
-                        if n >= 6:
+                        if n >= (6 if in_lobby or self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('clear_radius', 0) <= 200 else 25):   # v0.94.322: feltet – Stalchild dukker opp hele tiden om natta
                             break
                 except Exception as e:  # noqa: BLE001
                     log(f'pvp: feil {e!r}')
+                finally:
+                    self._pvp_scan_busy = False
+            self._pvp_scan_busy = True
             threading.Thread(target=run, daemon=True).start()
 
     PVP_SHOP_NPC = 'Npc_Hylia_038_Child'   # (navnet stemte ikke – se PVP_SHOP_POS)
@@ -12617,6 +12857,9 @@ class App:
                     if srv and self.p and self.ready and self.pad.hR is not None:
                         day, received = srv
                         fw = int(day + max(0, time.time() - received) * 120) % 86400
+                        ft_ = self._pvp_forced_time()
+                        if ft_ is not None:
+                            fw = ft_
                         self.p.write(self.p.base + self.pad.hR + 0xEF0, struct.pack('<II', fw, 0x4CBE))
                         if self.pad.write_time(self.p, fw):
                             if not getattr(self, '_server_clock_active', False):
@@ -12641,6 +12884,15 @@ class App:
 
     SERVER_TIME_SCALE = 120   # = TIME_SCALE i server.py
 
+    def _pvp_forced_time(self):
+        """v0.94.322: fast klokkeslett (spillsekunder) i arenaer med 'night' – None ellers."""
+        if getattr(self, 'mode', 'Story') != 'PvP' or not getattr(self, '_pvp_in_arena', False):
+            return None
+        t = self.ARENAS.get(getattr(self, '_arena_cur', 'gohma'), {}).get('night')
+        if t is None or getattr(self.pad, 'cur_banc', None) != self.PVP_BANC:
+            return None
+        return int(t) % 86400
+
     def _time_tick(self, now):
         pvp = getattr(self, 'mode', 'Story') == 'PvP'
         # v0.94.54: PvP-bakgrunnsskriving er midlertidig rullet tilbake etter gjentatt heng på begge PC-er.
@@ -12658,6 +12910,8 @@ class App:
         srv_ww = srv_st.get('weather') if now - getattr(self, '_server_seen', 0) < 5.0 else None
         srv_ww = int(srv_ww) if isinstance(srv_ww, int) and 0 <= srv_ww < len(PadLink.WEATHERS) else None
         fw = srv_time if srv_time is not None else ((self.friend or {}).get('wtime') if fresh and not pvp else None)
+        if pvp and self._pvp_forced_time() is not None:   # v0.94.322: natt-arena
+            srv_time = fw = self._pvp_forced_time()
         fww = srv_ww if srv_ww is not None else ((self.friend or {}).get('wweather') if fresh and not pvp else None)
         def run():
             try:

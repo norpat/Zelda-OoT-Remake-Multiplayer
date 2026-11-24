@@ -56,8 +56,8 @@ def udp_state_packet(state, pose_v2):
     return encode(dict(state, peers=peers))
 
 
-ARENAS = ("gohma", "sword", "zora")
-CTF_ARENAS = ("gohma", "zora")   # 2026-11-23: CTF-brett   # 2026-11-23: PvP-brett (se ARENAS i oot_mp_gui.py)
+ARENAS = ("gohma", "sword", "zora", "field")
+CTF_ARENAS = ("gohma", "zora", "field")   # 2026-11-23: CTF-brett   # 2026-11-23: PvP-brett (se ARENAS i oot_mp_gui.py)
 
 class ZeldaServer:
     def __init__(self, db_path="stats.db"):
@@ -480,7 +480,7 @@ class ZeldaServer:
             elif arena not in ARENAS:
                 error = "Ukjent brett"
             elif game_mode == "ctf" and arena not in CTF_ARENAS:
-                error = "Capture the flag finnes bare i Gohma-rommet og Zora's Domain"
+                error = "Capture the flag finnes bare i Gohma-rommet, Zora's Domain og Hyrule Field"
             else:
                 lobby_id = self.next_lobby
                 self.next_lobby += 1
@@ -542,7 +542,7 @@ class ZeldaServer:
             elif game_mode not in ("ctf", "deathmatch"):
                 error = "Ukjent spilltype"
             elif game_mode == "ctf" and lobby.get("arena", "gohma") not in CTF_ARENAS:
-                error = "Capture the flag finnes bare i Gohma-rommet og Zora's Domain"
+                error = "Capture the flag finnes bare i Gohma-rommet, Zora's Domain og Hyrule Field"
             else:
                 lobby["game_mode"] = game_mode
                 for member in self.members(lobby["id"], now).values():

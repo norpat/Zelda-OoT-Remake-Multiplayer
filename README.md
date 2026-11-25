@@ -43,6 +43,22 @@ python -m PyInstaller --noconfirm OoT_Multiplayer.spec
 
 The built executable will be in `src/dist/OoT_Multiplayer.exe`. You can also run `python src/oot_mp_gui.py` directly.
 
+## Networking: do I need the default server / a domain?
+No. By default the mod connects to the author's public server through an HTTPS tunnel (`SERVER_URL` in
+`src/oot_mp_gui.py`). That only exists so friends can play over the internet without opening ports. You can run your own
+server (`python src/server.py`, listens on UDP + TCP **27030**) and point the mod to it with an environment variable:
+
+| Setup | How to point the mod at your server | Notes |
+|---|---|---|
+| **Same home network (LAN)** | `OOT_SERVER_URL=http://192.168.1.50:27030` (the server PC's local IP) | Fastest, nothing exposed to the internet. |
+| **Over the internet with a VPN** (Tailscale, ZeroTier, …) | `OOT_SERVER_URL=http://<server VPN IP>:27030` | Recommended for friends: one virtual LAN, no open ports. |
+| **Over the internet with port forwarding** | `OOT_SERVER_URL=http://<public IP or dynamic-DNS name>:27030` | Forward UDP+TCP 27030 on your router to the server PC. |
+| **Through your own HTTPS tunnel** | `OOT_SERVER_URL=https://<your-tunnel-host>` | E.g. Cloudflare Tunnel or a reverse proxy in front of port 27030. |
+| **Direct UDP (testing)** | `OOT_PVP_LOCAL_PORT=27030` and `OOT_PVP_TEST_HOST=<server IP>` | Skips HTTP entirely. |
+
+Set the variable before starting `OoT_Multiplayer.exe`, e.g. in a small `.bat` file: `set OOT_SERVER_URL=http://192.168.1.50:27030`
+followed by `start "" OoT_Multiplayer.exe`. Everyone who should play together must use the same server.
+
 ## Known limitations
 
 - Work in progress: some bosses, cutscenes, and edge cases in Story and PvP are still being refined.

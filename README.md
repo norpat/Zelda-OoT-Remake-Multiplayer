@@ -43,10 +43,10 @@ python -m PyInstaller --noconfirm OoT_Multiplayer.spec
 
 The built executable will be in `src/dist/OoT_Multiplayer.exe`. You can also run `python src/oot_mp_gui.py` directly.
 
-## Networking: do I need the default server / a domain?
-No. By default the mod connects to the author's public server through an HTTPS tunnel (`SERVER_URL` in
-`src/oot_mp_gui.py`). That only exists so friends can play over the internet without opening ports. You can run your own
-server (`python src/server.py`, listens on UDP + TCP **27030**) and point the mod to it with an environment variable:
+## Networking: do I need the author's server / a domain?
+No. By default the mod connects to the author's own server (a personal domain used for developing and testing this
+project) through an HTTPS tunnel (`SERVER_URL` in `src/oot_mp_gui.py`). It is not a public service and may not always be
+online. You should run your own server (`python src/server.py`, listens on UDP + TCP **27030**) and point the mod to it with an environment variable:
 
 | Setup | How to point the mod at your server | Notes |
 |---|---|---|

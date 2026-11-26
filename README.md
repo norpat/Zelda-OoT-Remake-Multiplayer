@@ -31,6 +31,10 @@ Each player runs the game on their own Windows PC in the Lichii emulator. The mo
 2. Start the game in Lichii and load your save.
 3. Run `src/oot_mp_gui.py` (or build `OoT_Multiplayer.exe`), enter your player name, and choose **Story** or **PvP**.
 
+### Rust version (beta, exe only)
+
+Development has moved from Python to Rust. The Python version in this repository still works, but new work happens in the Rust rewrite. It was rewritten because Python was too slow for smooth, real-time sync between players. The Rust version (smoother movement, host-authoritative enemy sync, GAME OVER banner, built-in own server) is available as a ready-made `OoT_Multiplayer_rs.exe` under [Releases](../../releases). Its source code is not published. Use the same patches as above, then run the exe instead of `oot_mp_gui.py`. "My own server" → "Start local server" needs Python 3. Do not run the Rust and Python versions on the same PC at the same time.
+
 ## Build from source
 
 No `.exe` is included – build it from source:
